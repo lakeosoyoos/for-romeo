@@ -168,7 +168,18 @@ def _histogram_b64(pairs, title_str):
     return b64
 
 
-def _rows(pairs, top_n=TOP_N):
+# How many event columns (3 sub-cells each) fit on one landscape page with
+# the fixed left-side columns. 5 event groups leaves safe margin for the
+# total-loss columns on the last chunk.
+EVENTS_PER_CHUNK = 5
+
+
+def _rows(pairs, top_n, event_start, event_end, include_total):
+    """Render rows for a given slice of events.
+
+    event_start / event_end: half-open indices into each pair's per_event list.
+    include_total: whether to append the 3 total-loss columns on the right.
+    """
     out = ''
     for rank, p in enumerate(pairs[:top_n], 1):
         a, b = p['fiber_a'], p['fiber_b']
@@ -186,13 +197,18 @@ def _rows(pairs, top_n=TOP_N):
         else:
             gap_str, gap_cls = '---', ''
         evt_cells = ''
-        for pe in p['per_event']:
+        for pe in p['per_event'][event_start:event_end]:
             evt_cells += (f'<td class="center">{pe["loss_a"]:+.3f}</td>'
                           f'<td class="center">{pe["loss_b"]:+.3f}</td>'
                           f'<td class="center" style="font-weight:600">{pe["diff_mdB"]:.0f}</td>')
-        loss_a = p.get('total_loss_a', 0)
-        loss_b = p.get('total_loss_b', 0)
-        loss_diff = p.get('total_loss_diff', 0)
+        total_cells = ''
+        if include_total:
+            loss_a = p.get('total_loss_a', 0)
+            loss_b = p.get('total_loss_b', 0)
+            loss_diff = p.get('total_loss_diff', 0)
+            total_cells = (f'<td class="center">{loss_a}</td>'
+                           f'<td class="center">{loss_b}</td>'
+                           f'<td class="center" style="font-weight:600">{loss_diff}</td>')
         out += (f'<tr>'
                 f'<td class="center">{rank}</td>'
                 f'<td class="pair-cell">{a} &#8596; {b}</td>'
@@ -201,23 +217,53 @@ def _rows(pairs, top_n=TOP_N):
                 f'<td class="center" style="font-size:8px">{ts_b_str}</td>'
                 f'<td class="center"{gap_cls}>{gap_str}</td>'
                 f'{evt_cells}'
-                f'<td class="center">{loss_a}</td>'
-                f'<td class="center">{loss_b}</td>'
-                f'<td class="center" style="font-weight:600">{loss_diff}</td>'
+                f'{total_cells}'
                 f'</tr>\n')
     return out
 
 
-def _evt_headers(pairs):
+def _evt_headers(pairs, event_start, event_end, include_total):
     h, s = '', ''
     if pairs:
-        for pe in pairs[0]['per_event']:
+        for pe in pairs[0]['per_event'][event_start:event_end]:
             h += (f'<th colspan="3" style="border-left:2px solid #ddd">'
                   f'Evt #{pe["event"]} ({pe["dist_km"]:.3f} km)</th>')
             s += '<th class="r">Fib 1</th><th class="r">Fib 2</th><th class="r">&#916; mdB</th>'
-        h += '<th colspan="3" style="border-left:2px solid #ddd">Total Loss (mdB)</th>'
-        s += '<th class="r">Fib 1</th><th class="r">Fib 2</th><th class="r">&#916;</th>'
+        if include_total:
+            h += '<th colspan="3" style="border-left:2px solid #ddd">Total Loss (mdB)</th>'
+            s += '<th class="r">Fib 1</th><th class="r">Fib 2</th><th class="r">&#916;</th>'
     return h, s
+
+
+def _chunked_tables(pairs, title, total_events):
+    """Build one `<div class='table-section'>` per event chunk. First chunk
+    uses `title`; subsequent chunks append " (cont.)". Chunks after the first
+    start on a new page."""
+    if total_events == 0:
+        return ''
+    blocks = []
+    starts = list(range(0, total_events, EVENTS_PER_CHUNK))
+    for i, s in enumerate(starts):
+        e = min(s + EVENTS_PER_CHUNK, total_events)
+        is_last = (i == len(starts) - 1)
+        chunk_title = title if i == 0 else f'{title} (cont. events {s+1}&ndash;{e})'
+        evt_h, evt_s = _evt_headers(pairs, s, e, include_total=is_last)
+        rows_html = _rows(pairs, TOP_N, s, e, include_total=is_last)
+        page_break = '' if i == 0 else 'style="page-break-before:always; break-before:page;"'
+        blocks.append(f'''
+<div class="table-section" {page_break}>
+<h2>{chunk_title}</h2>
+<table class="vote-table">
+<thead>
+<tr><th>#</th><th style="text-align:left">Pair</th><th>Max Diff (mdB)</th><th>Time A</th><th>Time B</th><th>Gap</th>{evt_h}</tr>
+<tr><th></th><th style="text-align:left;font-size:7px;color:#888">Fiber 1 &#8596; Fiber 2</th><th></th><th></th><th></th><th></th>{evt_s}</tr>
+</thead>
+<tbody>
+{rows_html}
+</tbody>
+</table>
+</div>''')
+    return ''.join(blocks)
 
 
 def build_report(fibers, pairs, route_name, direction_label, fiber_nums):
@@ -228,15 +274,17 @@ def build_report(fibers, pairs, route_name, direction_label, fiber_nums):
     chart_b64 = _histogram_b64(pairs, direction_label) if show_chart else ''
     chart_html = f'<img src="data:image/png;base64,{chart_b64}" class="chart-img" />' if show_chart else ''
 
-    evt_h, evt_s = _evt_headers(pairs)
-    diff_rows = _rows(pairs, TOP_N)
+    total_events = len(pairs[0]['per_event']) if pairs else 0
 
+    diff_tables = _chunked_tables(
+        pairs, 'Ranked by Smallest Splice Loss Difference', total_events)
     time_sorted = sorted([p for p in pairs if p.get('time_gap_sec') is not None],
                          key=lambda x: x['time_gap_sec'])
-    time_rows = _rows(time_sorted, TOP_N)
-
+    time_tables = _chunked_tables(
+        time_sorted, 'Ranked by Shortest Time Gap', total_events)
     loss_sorted = sorted(pairs, key=lambda x: x.get('total_loss_diff', 999))
-    loss_rows = _rows(loss_sorted, TOP_N)
+    loss_tables = _chunked_tables(
+        loss_sorted, 'Ranked by Smallest Total Loss Difference', total_events)
 
     fiber_list = ', '.join(str(f) for f in fiber_nums)
 
@@ -257,7 +305,7 @@ def build_report(fibers, pairs, route_name, direction_label, fiber_nums):
 <title>{route_name} — Unidirectional Duplicate Report — Fibers {fiber_list}</title>
 <style>
 @page {{
-  size: landscape;
+  size: letter landscape;
   margin: 10mm 10mm 18mm 10mm;
   @bottom-center {{
     content: "Page " counter(page) " of " counter(pages);
@@ -272,7 +320,10 @@ def build_report(fibers, pairs, route_name, direction_label, fiber_nums):
 }}
 * {{ box-sizing:border-box; margin:0; padding:0; }}
 body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-        color:#2c2c2a; padding:16px; font-size:11px; max-width:1400px; margin:0 auto; }}
+        color:#2c2c2a; padding:0; font-size:11px; margin:0; }}
+@media screen {{
+  body {{ padding:16px; max-width:1400px; margin:0 auto; }}
+}}
 h1 {{ font-size:20px; font-weight:500; margin-bottom:2px; }}
 h2 {{ font-size:14px; font-weight:500; margin:24px 0 8px; }}
 .subtitle {{ font-size:11px; color:#888; margin-bottom:16px; }}
@@ -327,44 +378,13 @@ h2 {{ font-size:14px; font-weight:500; margin:24px 0 8px; }}
 
 {chart_html}
 
-<div class="table-section">
-<h2>Ranked by Smallest Splice Loss Difference</h2>
-<table class="vote-table">
-<thead>
-<tr><th>#</th><th style="text-align:left">Pair</th><th>Max Diff (mdB)</th><th>Time A</th><th>Time B</th><th>Gap</th>{evt_h}</tr>
-<tr><th></th><th style="text-align:left;font-size:7px;color:#888">Fiber 1 &#8596; Fiber 2</th><th></th><th></th><th></th><th></th>{evt_s}</tr>
-</thead>
-<tbody>
-{diff_rows}
-</tbody>
-</table>
-</div>
+{diff_tables}
 
-<div class="table-section">
-<h2>Ranked by Shortest Time Gap</h2>
-<table class="vote-table">
-<thead>
-<tr><th>#</th><th style="text-align:left">Pair</th><th>Max Diff (mdB)</th><th>Time A</th><th>Time B</th><th>Gap</th>{evt_h}</tr>
-<tr><th></th><th style="text-align:left;font-size:7px;color:#888">Fiber 1 &#8596; Fiber 2</th><th></th><th></th><th></th><th></th>{evt_s}</tr>
-</thead>
-<tbody>
-{time_rows}
-</tbody>
-</table>
-</div>
+<div style="page-break-before:always; break-before:page;"></div>
+{time_tables}
 
-<div class="table-section">
-<h2>Ranked by Smallest Total Loss Difference</h2>
-<table class="vote-table">
-<thead>
-<tr><th>#</th><th style="text-align:left">Pair</th><th>Max Diff (mdB)</th><th>Time A</th><th>Time B</th><th>Gap</th>{evt_h}</tr>
-<tr><th></th><th style="text-align:left;font-size:7px;color:#888">Fiber 1 &#8596; Fiber 2</th><th></th><th></th><th></th><th></th>{evt_s}</tr>
-</thead>
-<tbody>
-{loss_rows}
-</tbody>
-</table>
-</div>
+<div style="page-break-before:always; break-before:page;"></div>
+{loss_tables}
 
 </body></html>'''
 
