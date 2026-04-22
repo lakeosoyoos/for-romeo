@@ -207,36 +207,19 @@ html = build_report(fibers, pairs, route_name, direction_label, fiber_nums)
 
 safe_route = re.sub(r"[^A-Za-z0-9]+", "_", route_name).strip("_") or "report"
 
-st.subheader("Preview")
-st.components.v1.html(html, height=900, scrolling=True)
+# Cache the PDF so repeated downloads don't re-render.
+if st.session_state.get("pdf_html") != html:
+    with st.spinner("Rendering PDF…"):
+        try:
+            st.session_state["pdf_bytes"] = html_to_pdf_bytes(html, base_url=tmp_dir)
+            st.session_state["pdf_html"] = html
+        except Exception as e:
+            st.error(f"PDF export failed: {e}")
+            st.stop()
 
-st.subheader("Download")
-dl1, dl2 = st.columns(2)
-with dl1:
-    st.download_button(
-        "Download HTML",
-        data=html.encode("utf-8"),
-        file_name=f"{safe_route}_shortened.html",
-        mime="text/html",
-    )
-
-with dl2:
-    if (st.session_state.get("pdf_html") != html
-            or st.session_state.get("pdf_bytes") is None):
-        if st.button("Generate PDF"):
-            with st.spinner("Rendering PDF…"):
-                try:
-                    pdf_bytes = html_to_pdf_bytes(html, base_url=tmp_dir)
-                    st.session_state["pdf_bytes"] = pdf_bytes
-                    st.session_state["pdf_html"] = html
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"PDF export failed: {e}")
-    if (st.session_state.get("pdf_bytes") is not None
-            and st.session_state.get("pdf_html") == html):
-        st.download_button(
-            "Download PDF",
-            data=st.session_state["pdf_bytes"],
-            file_name=f"{safe_route}_shortened.pdf",
-            mime="application/pdf",
-        )
+st.download_button(
+    "Download PDF",
+    data=st.session_state["pdf_bytes"],
+    file_name=f"{safe_route}_shortened.pdf",
+    mime="application/pdf",
+)
