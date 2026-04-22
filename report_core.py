@@ -320,25 +320,23 @@ h2 {{ font-size:14px; font-weight:500; margin:24px 0 8px; }}
 </body></html>'''
 
 
-def find_chrome():
-    for p in ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-              '/usr/bin/google-chrome', '/usr/bin/chromium-browser']:
-        if os.path.isfile(p):
-            return p
-    return None
+def html_to_pdf_bytes(html_str, base_url=None):
+    """Render an HTML string to a PDF byte blob using WeasyPrint.
+
+    Works identically on macOS and on Streamlit Cloud (Debian) — no browser
+    required. `base_url` only matters if the HTML references local files by
+    relative path; this report embeds everything as base64, so it's optional.
+    """
+    from weasyprint import HTML
+    return HTML(string=html_str, base_url=base_url).write_pdf()
 
 
 def html_to_pdf(html_path, pdf_path):
-    import subprocess
-    chrome = find_chrome()
-    if not chrome:
-        return False, 'Chrome not found'
-    r = subprocess.run(
-        [chrome, '--headless=new', '--disable-gpu', '--no-sandbox',
-         '--run-all-compositor-stages-before-draw',
-         '--virtual-time-budget=5000',
-         f'--print-to-pdf={os.path.abspath(pdf_path)}',
-         '--print-to-pdf-no-header', '--no-pdf-header-footer',
-         'file://' + os.path.abspath(html_path)],
-        capture_output=True, timeout=180)
-    return r.returncode == 0, r.stderr.decode(errors='ignore')[:400]
+    """Backwards-compatible file-to-file wrapper."""
+    with open(html_path, 'r', encoding='utf-8') as fh:
+        html = fh.read()
+    base = os.path.dirname(os.path.abspath(html_path))
+    pdf_bytes = html_to_pdf_bytes(html, base_url=base)
+    with open(pdf_path, 'wb') as fh:
+        fh.write(pdf_bytes)
+    return True, ''

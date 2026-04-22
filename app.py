@@ -22,7 +22,7 @@ sys.path.insert(0, HERE)
 
 from report_core import (
     load_fiber, compare_pairs, build_report,
-    html_to_pdf, find_chrome, TOP_N,
+    html_to_pdf_bytes, TOP_N,
 )
 
 
@@ -201,22 +201,22 @@ with dl1:
     )
 
 with dl2:
-    pdf_path = os.path.join(tmp_dir, f"{safe_route}_shortened.pdf")
-    if find_chrome():
+    if "pdf_bytes" not in st.session_state or st.session_state.get("pdf_html") != html:
         if st.button("Generate PDF"):
-            with st.spinner("Rendering PDF via headless Chrome…"):
-                ok, err = html_to_pdf(html_path, pdf_path)
-            if ok and os.path.exists(pdf_path):
-                with open(pdf_path, "rb") as fh:
-                    st.download_button(
-                        "Download PDF",
-                        data=fh.read(),
-                        file_name=f"{safe_route}_shortened.pdf",
-                        mime="application/pdf",
-                    )
-            else:
-                st.error(f"PDF export failed: {err}")
-    else:
-        st.info("Install Google Chrome to enable PDF export.")
+            with st.spinner("Rendering PDF…"):
+                try:
+                    pdf_bytes = html_to_pdf_bytes(html, base_url=tmp_dir)
+                    st.session_state["pdf_bytes"] = pdf_bytes
+                    st.session_state["pdf_html"] = html
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"PDF export failed: {e}")
+    if st.session_state.get("pdf_bytes") is not None and st.session_state.get("pdf_html") == html:
+        st.download_button(
+            "Download PDF",
+            data=st.session_state["pdf_bytes"],
+            file_name=f"{safe_route}_shortened.pdf",
+            mime="application/pdf",
+        )
 
 st.caption(f"Working directory: {tmp_dir}")
