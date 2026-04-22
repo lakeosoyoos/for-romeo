@@ -266,9 +266,9 @@ def _chunked_tables(pairs, title, total_events):
     return ''.join(blocks)
 
 
-def build_report(fibers, pairs, route_name, direction_label, fiber_nums):
-    generated = datetime.now().strftime('%Y-%m-%d %H:%M')
-    n_fibers = len(fiber_nums)
+def build_direction_section(pairs, direction_label, section_index=0):
+    """Build the HTML fragment for ONE direction: banner + histogram + three
+    chunked ranking tables. `section_index` > 0 starts on a new page."""
     n_pairs = len(pairs)
     show_chart = n_pairs > 1
     chart_b64 = _histogram_b64(pairs, direction_label) if show_chart else ''
@@ -286,94 +286,10 @@ def build_report(fibers, pairs, route_name, direction_label, fiber_nums):
     loss_tables = _chunked_tables(
         loss_sorted, 'Ranked by Smallest Total Loss Difference', total_events)
 
-    fiber_list = ', '.join(str(f) for f in fiber_nums)
+    leading_break = ('<div style="page-break-before:always; break-before:page;"></div>'
+                     if section_index > 0 else '')
 
-    logo_b64 = ''
-    logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'zerodblogo.png')
-    if os.path.exists(logo_path):
-        with open(logo_path, 'rb') as f:
-            logo_b64 = base64.b64encode(f.read()).decode('ascii')
-    logo_html = (f'<div style="text-align:center; margin-bottom:16px;">'
-                 f'<img src="data:image/png;base64,{logo_b64}" '
-                 f'style="height:60px; margin-left:-30px;" /></div>') if logo_b64 else ''
-
-    min_pair = pairs[0] if pairs else {'max_diff_mdB': 0, 'fiber_a': '-', 'fiber_b': '-'}
-    median_val = np.median([p['max_diff_mdB'] for p in pairs]) if pairs else 0
-
-    return f'''<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<title>{route_name} — Unidirectional Duplicate Report — Fibers {fiber_list}</title>
-<style>
-@page {{
-  size: letter landscape;
-  margin: 10mm 10mm 18mm 10mm;
-  @bottom-center {{
-    content: "Page " counter(page) " of " counter(pages);
-    font-size: 8px; color: #000;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  }}
-  @bottom-right {{
-    content: "\\A9  ZeroDB";
-    font-size: 8px; color: #000;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  }}
-}}
-* {{ box-sizing:border-box; margin:0; padding:0; }}
-body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-        color:#2c2c2a; padding:0; font-size:11px; margin:0; }}
-@media screen {{
-  body {{ padding:16px; max-width:1400px; margin:0 auto; }}
-}}
-h1 {{ font-size:20px; font-weight:500; margin-bottom:2px; }}
-h2 {{ font-size:14px; font-weight:500; margin:24px 0 8px; }}
-.subtitle {{ font-size:11px; color:#888; margin-bottom:16px; }}
-.chart-img {{ width:100%; border-radius:8px; border:1px solid #ddd; margin-bottom:16px; }}
-.cards {{ display:flex; gap:10px; margin-bottom:16px; }}
-.card {{ flex:1; background:#fff; border:1px solid rgba(0,0,0,.08); border-radius:10px; padding:12px 14px; }}
-.card-label {{ font-size:9px; color:#999; margin-bottom:2px; text-transform:uppercase; letter-spacing:.04em; }}
-.card-value {{ font-size:22px; font-weight:600; }}
-.card-sub {{ font-size:9px; color:#999; margin-top:2px; }}
-.table-section {{ page-break-inside:auto; break-inside:auto; }}
-.table-section h2 {{ page-break-after:avoid; break-after:avoid; }}
-.vote-table {{ width:100%; border-collapse:collapse; font-size:9px;
-               font-family:'SF Mono','Courier New',monospace; margin-bottom:4px;
-               page-break-inside:auto; break-inside:auto; }}
-.vote-table thead {{ display:table-header-group; }}
-.vote-table tbody {{ display:table-row-group; }}
-.vote-table th {{ background:#f4f3f0; padding:5px 6px; text-align:center;
-                  font-weight:600; border:0.5px solid #ddd; font-size:8px; color:#555; }}
-.vote-table td {{ padding:4px 6px; border:0.5px solid #ddd; }}
-.vote-table tr {{ page-break-inside:avoid; break-inside:avoid; }}
-.pair-cell {{ text-align:left !important; font-weight:600; }}
-.center {{ text-align:center; }}
-.r {{ text-align:right; }}
-.bold {{ font-weight:600; }}
-.dir-banner {{ background:#2C3E50; color:white; padding:10px 16px; border-radius:8px;
-               font-size:14px; font-weight:600; margin:28px 0 12px; }}
-</style></head><body>
-
-{logo_html}
-<h1>{route_name} — Unidirectional Duplicate Report</h1>
-<div class="subtitle">Fibers {fiber_list} &bull; {n_fibers} fibers &bull; {n_pairs} pairs &bull; generated {generated}</div>
-
-<div class="cards">
-  <div class="card">
-    <div class="card-label">Closest pair</div>
-    <div class="card-value">{min_pair["max_diff_mdB"]:.0f} mdB</div>
-    <div class="card-sub">{min_pair["fiber_a"]} &#8596; {min_pair["fiber_b"]}</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Median max diff</div>
-    <div class="card-value">{median_val:.0f} mdB</div>
-    <div class="card-sub">{n_pairs} pairs</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Fibers loaded</div>
-    <div class="card-value">{n_fibers}</div>
-    <div class="card-sub">from {direction_label}</div>
-  </div>
-</div>
-
+    return f'''{leading_break}
 <div class="dir-banner">Direction: {direction_label}</div>
 
 {chart_html}
@@ -385,8 +301,141 @@ h2 {{ font-size:14px; font-weight:500; margin:24px 0 8px; }}
 
 <div style="page-break-before:always; break-before:page;"></div>
 {loss_tables}
+'''
+
+
+def _logo_html():
+    logo_b64 = ''
+    logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'zerodblogo.png')
+    if os.path.exists(logo_path):
+        with open(logo_path, 'rb') as f:
+            logo_b64 = base64.b64encode(f.read()).decode('ascii')
+    if not logo_b64:
+        return ''
+    return (f'<div style="text-align:center; margin-bottom:16px;">'
+            f'<img src="data:image/png;base64,{logo_b64}" '
+            f'style="height:60px; margin-left:-30px;" /></div>')
+
+
+_PAGE_CSS = '''
+@page {
+  size: letter landscape;
+  margin: 10mm 10mm 18mm 10mm;
+  @bottom-center {
+    content: "Page " counter(page) " of " counter(pages);
+    font-size: 8px; color: #000;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+  @bottom-right {
+    content: "\\A9  ZeroDB";
+    font-size: 8px; color: #000;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+       color:#2c2c2a; padding:0; font-size:11px; margin:0; }
+@media screen {
+  body { padding:16px; max-width:1400px; margin:0 auto; }
+}
+h1 { font-size:20px; font-weight:500; margin-bottom:2px; }
+h2 { font-size:14px; font-weight:500; margin:24px 0 8px; }
+.subtitle { font-size:11px; color:#888; margin-bottom:16px; }
+.chart-img { width:100%; border-radius:8px; border:1px solid #ddd; margin-bottom:16px; }
+.cards { display:flex; gap:10px; margin-bottom:16px; flex-wrap:wrap; }
+.card { flex:1 1 180px; background:#fff; border:1px solid rgba(0,0,0,.08);
+        border-radius:10px; padding:12px 14px; }
+.card-label { font-size:9px; color:#999; margin-bottom:2px; text-transform:uppercase; letter-spacing:.04em; }
+.card-value { font-size:22px; font-weight:600; }
+.card-sub { font-size:9px; color:#999; margin-top:2px; }
+.table-section { page-break-inside:auto; break-inside:auto; }
+.table-section h2 { page-break-after:avoid; break-after:avoid; }
+.vote-table { width:100%; border-collapse:collapse; font-size:9px;
+              font-family:'SF Mono','Courier New',monospace; margin-bottom:4px;
+              page-break-inside:auto; break-inside:auto; }
+.vote-table thead { display:table-header-group; }
+.vote-table tbody { display:table-row-group; }
+.vote-table th { background:#f4f3f0; padding:5px 6px; text-align:center;
+                 font-weight:600; border:0.5px solid #ddd; font-size:8px; color:#555; }
+.vote-table td { padding:4px 6px; border:0.5px solid #ddd; }
+.vote-table tr { page-break-inside:avoid; break-inside:avoid; }
+.pair-cell { text-align:left !important; font-weight:600; }
+.center { text-align:center; }
+.r { text-align:right; }
+.bold { font-weight:600; }
+.dir-banner { background:#2C3E50; color:white; padding:10px 16px; border-radius:8px;
+              font-size:14px; font-weight:600; margin:28px 0 12px; }
+'''
+
+
+def build_combined_report(route_name, directions):
+    """Build a single HTML report covering multiple directions.
+
+    `directions` is a list of dicts, each with keys:
+        label     — direction label string (e.g. 'DNW → RCH')
+        pairs     — output of compare_pairs() for that direction
+        fiber_nums— sorted list of fiber numbers for that direction
+    """
+    generated = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    # Summary cards: one pair of cards per direction (closest + median).
+    cards_html = ''
+    for d in directions:
+        pairs = d['pairs']
+        label = d['label']
+        if pairs:
+            mp = pairs[0]
+            med = np.median([p['max_diff_mdB'] for p in pairs])
+            cards_html += (
+                f'<div class="card">'
+                f'<div class="card-label">{label} — closest pair</div>'
+                f'<div class="card-value">{mp["max_diff_mdB"]:.0f} mdB</div>'
+                f'<div class="card-sub">{mp["fiber_a"]} &#8596; {mp["fiber_b"]}</div>'
+                f'</div>'
+                f'<div class="card">'
+                f'<div class="card-label">{label} — median</div>'
+                f'<div class="card-value">{med:.0f} mdB</div>'
+                f'<div class="card-sub">{len(pairs)} pairs</div>'
+                f'</div>'
+            )
+
+    # Subtitle gives the combined fiber count per direction.
+    subtitle_bits = []
+    for d in directions:
+        subtitle_bits.append(
+            f'{d["label"]}: {len(d["fiber_nums"])} fibers / {len(d["pairs"])} pairs'
+        )
+    subtitle = ' &nbsp;&bull;&nbsp; '.join(subtitle_bits)
+
+    sections = ''.join(
+        build_direction_section(d['pairs'], d['label'], section_index=i)
+        for i, d in enumerate(directions)
+    )
+
+    return f'''<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>{route_name} — Unidirectional Duplicate Report</title>
+<style>{_PAGE_CSS}</style></head><body>
+
+{_logo_html()}
+<h1>{route_name} — Unidirectional Duplicate Report</h1>
+<div class="subtitle">{subtitle} &nbsp;&bull;&nbsp; generated {generated}</div>
+
+<div class="cards">{cards_html}</div>
+
+{sections}
 
 </body></html>'''
+
+
+def build_report(fibers, pairs, route_name, direction_label, fiber_nums):
+    """Backwards-compatible single-direction wrapper (kept for any external
+    callers). New code should use build_combined_report."""
+    return build_combined_report(route_name, [{
+        'label': direction_label,
+        'pairs': pairs,
+        'fiber_nums': fiber_nums,
+    }])
 
 
 def html_to_pdf_bytes(html_str, base_url=None):

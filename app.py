@@ -1,11 +1,10 @@
 """
 For Romeo April 21 — Unidirectional Shortened Duplicate Report with Loss.
 
-Upload either a .zip of SOR files or the .sor files directly. The app:
-  1. Finds every distinct filename prefix (each = one direction).
-  2. For every direction with >=2 fibers, builds a separate report
-     and renders a PDF.
-  3. Shows one download button per direction.
+Upload either a .zip of SOR files or the .sor files directly. Every distinct
+filename prefix is treated as its own direction; a single combined PDF is
+produced with one section per direction (each section has its own banner,
+histogram, and three ranking tables).
 
 Run:  streamlit run app.py
 """
@@ -22,22 +21,22 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from report_core import (
-    load_fiber, compare_pairs, build_report,
+    load_fiber, compare_pairs, build_combined_report,
     html_to_pdf_bytes, TOP_N,
 )
 
 
 st.set_page_config(
-    page_title="For Romeo April 21 — Unidirectional Shortened Report",
+    page_title="For Romeo April 21 — Shortened Duplicate Report",
     layout="wide",
 )
 
-st.title("Unidirectional Shortened Duplicate Report (with Loss)")
+st.title("Shortened Duplicate Report (with Loss)")
 st.caption(
-    "Upload a .zip of SOR files or the .sor files directly. Every distinct "
-    "filename prefix is treated as its own direction; one PDF is produced "
-    f"per direction. Top {TOP_N} pairs per ranking, multi-page tables with "
-    "repeating headers."
+    "Upload a .zip of SOR files or the .sor files directly. The app detects "
+    "every distinct filename prefix, treats each one as a direction, and "
+    f"builds a single combined PDF with one section per direction. Top {TOP_N} "
+    "pairs per ranking, multi-page tables with repeating headers."
 )
 
 # ----- upload -----------------------------------------------------------
@@ -97,8 +96,6 @@ st.success(f"Loaded {len(saved_paths)} SOR file(s).")
 
 # ----- group files by (prefix, suffix) = direction ----------------------
 def group_by_direction(filenames):
-    """Return {(prefix, suffix): {fiber_num: basename}} for every distinct
-    prefix/suffix pair found in the uploaded files."""
     groups = defaultdict(dict)
     for fn in filenames:
         base = os.path.basename(fn)
@@ -107,7 +104,7 @@ def group_by_direction(filenames):
         stem = base[:-4]
         m = None
         for candidate in re.finditer(r"\d+", stem):
-            m = candidate  # last digit run → fiber number
+            m = candidate
         if not m:
             continue
         pre = stem[: m.start()]
@@ -118,7 +115,6 @@ def group_by_direction(filenames):
 
 
 groups = group_by_direction([os.path.basename(p) for p in saved_paths])
-# Drop groups with fewer than 2 fibers (no pairs possible)
 groups = {k: v for k, v in groups.items() if len(v) >= 2}
 
 if not groups:
@@ -128,16 +124,8 @@ if not groups:
     )
     st.stop()
 
-st.write(
-    f"Detected **{len(groups)} direction(s)**: "
-    + ", ".join(
-        f"`{(pre or '∅')}…{suf}` ({len(fm)} fibers)"
-        for (pre, suf), fm in groups.items()
-    )
-)
 
-
-# ----- process each direction -------------------------------------------
+# ----- parse each direction ---------------------------------------------
 def pick_common(values):
     vals = [v for v in values if v]
     if not vals:
@@ -145,9 +133,7 @@ def pick_common(values):
     return Counter(vals).most_common(1)[0][0]
 
 
-def build_direction(prefix, suffix, fiber_map):
-    """Parse + compare + build HTML for one direction. Returns (label_dict,
-    html_str) or (None, None) if something failed."""
+def process_direction(prefix, suffix, fiber_map):
     fiber_nums = sorted(fiber_map.keys())
     fibers = {}
     for n in fiber_nums:
@@ -157,81 +143,97 @@ def build_direction(prefix, suffix, fiber_map):
         except Exception as e:
             st.warning(f"Failed to parse {fiber_map[n]}: {e}")
     if len(fibers) < 2:
-        return None, None
+        return None
 
     gp_list = [fibers[k].get('gen_params', {}) or {} for k in fibers]
     loc_a = pick_common([g.get('location_a', '') for g in gp_list])
     loc_b = pick_common([g.get('location_b', '') for g in gp_list])
     cable_id = pick_common([g.get('cable_id', '') for g in gp_list])
     cable_code = pick_common([g.get('cable_code', '') for g in gp_list])
-
     clean_prefix = prefix.rstrip("-_ ") or "Route"
-    route_name = cable_id or cable_code or clean_prefix
-    direction_label = f"{loc_a} → {loc_b}" if loc_a and loc_b else clean_prefix
+    label = f"{loc_a} → {loc_b}" if loc_a and loc_b else clean_prefix
+    route_hint = cable_id or cable_code or clean_prefix
 
     pairs = compare_pairs(fibers)
-    html = build_report(fibers, pairs, route_name, direction_label, fiber_nums)
-
-    median_diff = (sorted(p['max_diff_mdB'] for p in pairs)[len(pairs) // 2]
-                   if pairs else 0)
-    info = {
-        'prefix': prefix,
-        'suffix': suffix,
-        'route_name': route_name,
-        'direction_label': direction_label,
-        'n_fibers': len(fibers),
-        'n_pairs': len(pairs),
-        'closest_mdB': pairs[0]['max_diff_mdB'] if pairs else 0,
-        'median_mdB': median_diff,
+    return {
+        'label': label,
+        'pairs': pairs,
+        'fiber_nums': fiber_nums,
+        'route_hint': route_hint,
         'loc_a': loc_a, 'loc_b': loc_b,
+        'prefix': prefix,
     }
-    return info, html
 
 
-# Cache PDFs in session state keyed by (prefix, suffix)
-if "pdf_cache" not in st.session_state:
-    st.session_state["pdf_cache"] = {}
-
-
+directions = []
 for (pre, suf), fiber_map in groups.items():
-    with st.spinner(f"Processing {pre or '∅'} ({len(fiber_map)} fibers)…"):
-        info, html = build_direction(pre, suf, fiber_map)
+    with st.spinner(f"Parsing {len(fiber_map)} fibers from '{pre or '∅'}'…"):
+        d = process_direction(pre, suf, fiber_map)
+    if d is not None:
+        directions.append(d)
 
-    if info is None:
-        st.warning(f"Skipped direction '{pre}' — not enough parseable fibers.")
-        continue
+if not directions:
+    st.error("No direction had at least 2 parseable fibers.")
+    st.stop()
 
-    st.divider()
-    st.subheader(f"{info['route_name']} — {info['direction_label']}")
+# If two directions ended up with the same GenParams label (firmware quirk
+# where A/B locations don't match the filename convention), fall back to
+# the cleaned filename prefix so sections are distinguishable.
+label_counts = Counter(d['label'] for d in directions)
+collisions = {label for label, c in label_counts.items() if c > 1}
+for d in directions:
+    if d['label'] in collisions:
+        clean = d['prefix'].rstrip('-_ ') or 'Direction'
+        if d['loc_a'] and d['loc_b']:
+            d['label'] = f"{clean} ({d['loc_a']} → {d['loc_b']})"
+        else:
+            d['label'] = clean
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Fibers", info['n_fibers'])
-    c2.metric("Pairs", info['n_pairs'])
-    c3.metric("Closest (mdB)", f"{info['closest_mdB']:.0f}")
-    c4.metric("Median (mdB)", f"{info['median_mdB']:.0f}")
 
-    cache_key = (pre, suf)
-    cache = st.session_state["pdf_cache"]
-    if cache.get(cache_key, {}).get("html") != html:
+# ----- derive a single route name across all directions ----------------
+route_name = pick_common([d['route_hint'] for d in directions]) or "Route"
+
+
+# ----- summary ----------------------------------------------------------
+st.write(
+    f"Detected **{len(directions)} direction(s)** in route **{route_name}**."
+)
+
+cols = st.columns(len(directions))
+for col, d in zip(cols, directions):
+    pairs = d['pairs']
+    closest = f"{pairs[0]['max_diff_mdB']:.0f}" if pairs else "—"
+    median_val = (sorted(p['max_diff_mdB'] for p in pairs)[len(pairs) // 2]
+                  if pairs else 0)
+    col.markdown(f"**{d['label']}**")
+    col.metric("Fibers", len(d['fiber_nums']))
+    col.metric("Pairs", len(pairs))
+    col.metric("Closest (mdB)", closest)
+    col.metric("Median (mdB)", f"{median_val:.0f}")
+
+
+# ----- build combined report + PDF --------------------------------------
+html = build_combined_report(route_name, [{
+    'label': d['label'],
+    'pairs': d['pairs'],
+    'fiber_nums': d['fiber_nums'],
+} for d in directions])
+
+if st.session_state.get("pdf_html") != html:
+    with st.spinner("Rendering combined PDF…"):
         try:
-            pdf_bytes = html_to_pdf_bytes(html, base_url=tmp_dir)
-            cache[cache_key] = {"html": html, "pdf": pdf_bytes}
+            st.session_state["pdf_bytes"] = html_to_pdf_bytes(html, base_url=tmp_dir)
+            st.session_state["pdf_html"] = html
         except Exception as e:
-            st.error(f"PDF export failed for {pre}: {e}")
-            continue
+            st.error(f"PDF export failed: {e}")
+            st.stop()
 
-    safe_route = re.sub(r"[^A-Za-z0-9]+", "_", info['route_name']).strip("_") or "route"
-    dir_slug = (
-        f"{info['loc_a']}_to_{info['loc_b']}" if info['loc_a'] and info['loc_b']
-        else (pre.rstrip('-_ ') or 'dir')
-    )
-    dir_slug = re.sub(r"[^A-Za-z0-9]+", "_", dir_slug).strip("_") or "dir"
-    fname = f"{safe_route}_{dir_slug}_shortened.pdf"
+safe_route = re.sub(r"[^A-Za-z0-9]+", "_", route_name).strip("_") or "route"
+fname = f"{safe_route}_bidir_shortened.pdf"
 
-    st.download_button(
-        f"Download PDF — {info['direction_label']}",
-        data=cache[cache_key]["pdf"],
-        file_name=fname,
-        mime="application/pdf",
-        key=f"dl_{pre}_{suf}",
-    )
+st.download_button(
+    "Download combined PDF",
+    data=st.session_state["pdf_bytes"],
+    file_name=fname,
+    mime="application/pdf",
+)
