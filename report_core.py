@@ -22,6 +22,53 @@ import matplotlib.pyplot as plt
 TOP_N = 25
 
 
+def _read_cstr(raw, offset):
+    end = raw.find(b'\x00', offset)
+    if end < 0:
+        return '', offset
+    try:
+        s = raw[offset:end].decode('latin-1', errors='replace').strip()
+    except Exception:
+        s = ''
+    return s, end + 1
+
+
+def parse_gen_params(filepath):
+    """Pull route-level metadata from the SOR GenParams block.
+
+    Returns a dict with whatever could be read (empty strings otherwise):
+    cable_id, fiber_id, location_a, location_b, cable_code, operator, comment.
+    """
+    with open(filepath, 'rb') as f:
+        raw = f.read()
+    marker = b'GenParams\x00'
+    i = raw.find(marker, 50)
+    if i < 0:
+        return {}
+    p = i + len(marker)
+    # Telcordia SR-4731: language code (2 bytes) then strings in order.
+    # Skip language code bytes (2). Some firmwares also have a 2-byte index;
+    # we are lenient and just skip the next 2 bytes unconditionally.
+    p += 2
+    out = {}
+    for key in ('cable_id', 'fiber_id', 'fiber_type_code',
+                'wavelength_code', 'location_a', 'location_b',
+                'cable_code', 'build_condition'):
+        if key in ('fiber_type_code', 'wavelength_code'):
+            if p + 2 <= len(raw):
+                out[key] = struct.unpack_from('<H', raw, p)[0]
+                p += 2
+            continue
+        s, p = _read_cstr(raw, p)
+        out[key] = s
+    # two 4-byte offsets (user offset + distance)
+    p += 8
+    for key in ('operator', 'comment'):
+        s, p = _read_cstr(raw, p)
+        out[key] = s
+    return out
+
+
 def load_fiber(filepath):
     parsed = parse_sor_with_windows(filepath)
     events = parsed['events']
@@ -52,12 +99,14 @@ def load_fiber(filepath):
             'reflection': evt['reflection_fw'],
         })
     total_loss = total_splice + total_fiber_atten
+    gp = parse_gen_params(filepath)
     return {'events': evt_list, 'timestamp': ts, 'filesize': len(raw),
             'filename': os.path.basename(filepath),
             'total_splice_dB': total_splice,
             'total_fiber_atten_dB': total_fiber_atten,
             'total_loss_dB': total_loss,
-            'total_loss_mdB': round(total_loss * 1000)}
+            'total_loss_mdB': round(total_loss * 1000),
+            'gen_params': gp}
 
 
 def compare_pairs(fibers):
