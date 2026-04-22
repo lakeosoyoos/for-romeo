@@ -1,9 +1,11 @@
 """
 For Romeo April 21 — Unidirectional Shortened Duplicate Report with Loss.
 
-Upload either a .zip of unidirectional SOR files or the .sor files directly.
-The app auto-detects the filename prefix, fiber numbers, and reads the
-route/direction labels from the SOR GenParams block. No manual settings.
+Upload either a .zip of SOR files or the .sor files directly. The app:
+  1. Finds every distinct filename prefix (each = one direction).
+  2. For every direction with >=2 fibers, builds a separate report
+     and renders a PDF.
+  3. Shows one download button per direction.
 
 Run:  streamlit run app.py
 """
@@ -12,7 +14,7 @@ import re
 import sys
 import tempfile
 import zipfile
-from collections import Counter
+from collections import Counter, defaultdict
 
 import streamlit as st
 
@@ -32,10 +34,10 @@ st.set_page_config(
 
 st.title("Unidirectional Shortened Duplicate Report (with Loss)")
 st.caption(
-    "Upload a .zip of SOR files or the .sor files directly. The app reads the "
-    "route name, direction, and fiber numbers from the files themselves — no "
-    "settings to configure. Top "
-    f"{TOP_N} pairs per ranking, multi-page tables with repeating headers."
+    "Upload a .zip of SOR files or the .sor files directly. Every distinct "
+    "filename prefix is treated as its own direction; one PDF is produced "
+    f"per direction. Top {TOP_N} pairs per ranking, multi-page tables with "
+    "repeating headers."
 )
 
 # ----- upload -----------------------------------------------------------
@@ -55,8 +57,6 @@ tmp_dir = tempfile.mkdtemp(prefix="romeo_sor_")
 
 
 def _extract(uf, dest_dir):
-    """Save one upload to disk. Zip files are expanded (flat — .sor files
-    only). Returns a list of saved .sor file paths."""
     name = uf.name
     data = uf.getbuffer()
     if name.lower().endswith(".zip"):
@@ -95,51 +95,60 @@ if not saved_paths:
 st.success(f"Loaded {len(saved_paths)} SOR file(s).")
 
 
-# ----- auto-detect prefix/suffix/fiber numbers --------------------------
-def detect_prefix_suffix(filenames):
-    pat_stem = re.compile(r"\.sor$", re.IGNORECASE)
-    combos = Counter()
-    parsed = []
+# ----- group files by (prefix, suffix) = direction ----------------------
+def group_by_direction(filenames):
+    """Return {(prefix, suffix): {fiber_num: basename}} for every distinct
+    prefix/suffix pair found in the uploaded files."""
+    groups = defaultdict(dict)
     for fn in filenames:
         base = os.path.basename(fn)
-        if not pat_stem.search(base):
+        if not base.lower().endswith(".sor"):
             continue
-        stem = base[:-4]  # drop '.sor'
+        stem = base[:-4]
         m = None
         for candidate in re.finditer(r"\d+", stem):
-            m = candidate  # last digit run
+            m = candidate  # last digit run → fiber number
         if not m:
             continue
         pre = stem[: m.start()]
         suf = stem[m.end():]
         num = int(m.group(0))
-        combos[(pre, suf)] += 1
-        parsed.append((pre, suf, num, base))
-    if not combos:
-        return None, None, {}
-    (best_pre, best_suf), _ = combos.most_common(1)[0]
-    fiber_map = {}
-    for pre, suf, num, base in parsed:
-        if pre == best_pre and suf == best_suf:
-            fiber_map[num] = base
-    return best_pre, best_suf, fiber_map
+        groups[(pre, suf)][num] = base
+    return groups
 
 
-prefix, suffix, fiber_map = detect_prefix_suffix(
-    [os.path.basename(p) for p in saved_paths]
-)
-if not fiber_map or len(fiber_map) < 2:
+groups = group_by_direction([os.path.basename(p) for p in saved_paths])
+# Drop groups with fewer than 2 fibers (no pairs possible)
+groups = {k: v for k, v in groups.items() if len(v) >= 2}
+
+if not groups:
     st.error(
-        "Could not detect a consistent fiber-number pattern, or fewer than 2 "
-        "fibers matched. Check that the uploaded files share a common naming."
+        "Could not find any prefix with ≥2 fibers. Check that the uploaded "
+        "files share a consistent naming pattern."
     )
     st.stop()
 
-fiber_nums = sorted(fiber_map.keys())
+st.write(
+    f"Detected **{len(groups)} direction(s)**: "
+    + ", ".join(
+        f"`{(pre or '∅')}…{suf}` ({len(fm)} fibers)"
+        for (pre, suf), fm in groups.items()
+    )
+)
 
 
-# ----- parse & compare ---------------------------------------------------
-with st.spinner(f"Parsing {len(fiber_nums)} SOR files…"):
+# ----- process each direction -------------------------------------------
+def pick_common(values):
+    vals = [v for v in values if v]
+    if not vals:
+        return ""
+    return Counter(vals).most_common(1)[0][0]
+
+
+def build_direction(prefix, suffix, fiber_map):
+    """Parse + compare + build HTML for one direction. Returns (label_dict,
+    html_str) or (None, None) if something failed."""
+    fiber_nums = sorted(fiber_map.keys())
     fibers = {}
     for n in fiber_nums:
         fp = os.path.join(tmp_dir, fiber_map[n])
@@ -147,79 +156,82 @@ with st.spinner(f"Parsing {len(fiber_nums)} SOR files…"):
             fibers[f"{n:04d}"] = load_fiber(fp)
         except Exception as e:
             st.warning(f"Failed to parse {fiber_map[n]}: {e}")
+    if len(fibers) < 2:
+        return None, None
 
-if len(fibers) < 2:
-    st.error("Not enough fibers parsed to run comparisons.")
-    st.stop()
+    gp_list = [fibers[k].get('gen_params', {}) or {} for k in fibers]
+    loc_a = pick_common([g.get('location_a', '') for g in gp_list])
+    loc_b = pick_common([g.get('location_b', '') for g in gp_list])
+    cable_id = pick_common([g.get('cable_id', '') for g in gp_list])
+    cable_code = pick_common([g.get('cable_code', '') for g in gp_list])
 
+    clean_prefix = prefix.rstrip("-_ ") or "Route"
+    route_name = cable_id or cable_code or clean_prefix
+    direction_label = f"{loc_a} → {loc_b}" if loc_a and loc_b else clean_prefix
 
-# ----- derive route name and direction label from GenParams --------------
-def pick_common(values):
-    """Return the most common non-empty value, or '' if none."""
-    vals = [v for v in values if v]
-    if not vals:
-        return ""
-    return Counter(vals).most_common(1)[0][0]
-
-
-gp_list = [fibers[k].get('gen_params', {}) or {} for k in fibers]
-cable_id = pick_common([g.get('cable_id', '') for g in gp_list])
-loc_a = pick_common([g.get('location_a', '') for g in gp_list])
-loc_b = pick_common([g.get('location_b', '') for g in gp_list])
-cable_code = pick_common([g.get('cable_code', '') for g in gp_list])
-
-route_name = cable_id or cable_code or (prefix.rstrip("-_ ") or "Route")
-if loc_a and loc_b:
-    direction_label = f"{loc_a} → {loc_b}"
-else:
-    direction_label = (prefix.rstrip("-_ ") or "Direction")
-
-
-# ----- summary ----------------------------------------------------------
-with st.spinner(f"Comparing {len(fibers)*(len(fibers)-1)//2} pairs…"):
     pairs = compare_pairs(fibers)
+    html = build_report(fibers, pairs, route_name, direction_label, fiber_nums)
 
-n_pairs = len(pairs)
-median_diff = sorted(p['max_diff_mdB'] for p in pairs)[n_pairs // 2] if pairs else 0
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Route", route_name[:18] + ("…" if len(route_name) > 18 else ""))
-c2.metric("Direction", direction_label[:22] + ("…" if len(direction_label) > 22 else ""))
-c3.metric("Fibers", len(fibers))
-c4.metric("Pairs", n_pairs)
-
-c5, c6, c7 = st.columns(3)
-c5.metric("Closest pair (mdB)", f"{pairs[0]['max_diff_mdB']:.0f}" if pairs else "—")
-c6.metric("Median max diff (mdB)", f"{median_diff:.0f}" if pairs else "—")
-c7.metric("Prefix detected", prefix or "—")
-
-with st.expander("Fibers parsed (click for detail)", expanded=False):
-    for n in fiber_nums:
-        gp = fibers.get(f"{n:04d}", {}).get('gen_params', {}) or {}
-        cid = gp.get('cable_id', '')
-        fid = gp.get('fiber_id', '')
-        st.text(f"  fiber {n:>5}  →  {fiber_map[n]}   "
-                f"[cable={cid!s} fiber_id={fid!s}]")
+    median_diff = (sorted(p['max_diff_mdB'] for p in pairs)[len(pairs) // 2]
+                   if pairs else 0)
+    info = {
+        'prefix': prefix,
+        'suffix': suffix,
+        'route_name': route_name,
+        'direction_label': direction_label,
+        'n_fibers': len(fibers),
+        'n_pairs': len(pairs),
+        'closest_mdB': pairs[0]['max_diff_mdB'] if pairs else 0,
+        'median_mdB': median_diff,
+        'loc_a': loc_a, 'loc_b': loc_b,
+    }
+    return info, html
 
 
-# ----- build report ------------------------------------------------------
-html = build_report(fibers, pairs, route_name, direction_label, fiber_nums)
+# Cache PDFs in session state keyed by (prefix, suffix)
+if "pdf_cache" not in st.session_state:
+    st.session_state["pdf_cache"] = {}
 
-safe_route = re.sub(r"[^A-Za-z0-9]+", "_", route_name).strip("_") or "report"
 
-# Cache the PDF so repeated downloads don't re-render.
-if st.session_state.get("pdf_html") != html:
-    with st.spinner("Rendering PDF…"):
+for (pre, suf), fiber_map in groups.items():
+    with st.spinner(f"Processing {pre or '∅'} ({len(fiber_map)} fibers)…"):
+        info, html = build_direction(pre, suf, fiber_map)
+
+    if info is None:
+        st.warning(f"Skipped direction '{pre}' — not enough parseable fibers.")
+        continue
+
+    st.divider()
+    st.subheader(f"{info['route_name']} — {info['direction_label']}")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Fibers", info['n_fibers'])
+    c2.metric("Pairs", info['n_pairs'])
+    c3.metric("Closest (mdB)", f"{info['closest_mdB']:.0f}")
+    c4.metric("Median (mdB)", f"{info['median_mdB']:.0f}")
+
+    cache_key = (pre, suf)
+    cache = st.session_state["pdf_cache"]
+    if cache.get(cache_key, {}).get("html") != html:
         try:
-            st.session_state["pdf_bytes"] = html_to_pdf_bytes(html, base_url=tmp_dir)
-            st.session_state["pdf_html"] = html
+            pdf_bytes = html_to_pdf_bytes(html, base_url=tmp_dir)
+            cache[cache_key] = {"html": html, "pdf": pdf_bytes}
         except Exception as e:
-            st.error(f"PDF export failed: {e}")
-            st.stop()
+            st.error(f"PDF export failed for {pre}: {e}")
+            continue
 
-st.download_button(
-    "Download PDF",
-    data=st.session_state["pdf_bytes"],
-    file_name=f"{safe_route}_shortened.pdf",
-    mime="application/pdf",
-)
+    safe_route = re.sub(r"[^A-Za-z0-9]+", "_", info['route_name']).strip("_") or "route"
+    dir_slug = (
+        f"{info['loc_a']}_to_{info['loc_b']}" if info['loc_a'] and info['loc_b']
+        else (pre.rstrip('-_ ') or 'dir')
+    )
+    dir_slug = re.sub(r"[^A-Za-z0-9]+", "_", dir_slug).strip("_") or "dir"
+    fname = f"{safe_route}_{dir_slug}_shortened.pdf"
+
+    st.download_button(
+        f"Download PDF — {info['direction_label']}",
+        data=cache[cache_key]["pdf"],
+        file_name=fname,
+        mime="application/pdf",
+        key=f"dl_{pre}_{suf}",
+    )
