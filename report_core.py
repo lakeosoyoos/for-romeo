@@ -69,6 +69,153 @@ def parse_gen_params(filepath):
     return out
 
 
+def _find_key(tree, targets_lower):
+    """Recursively walk a JSON tree and return the first string value whose
+    key (case-insensitive) matches any of `targets_lower`. Returns '' if not
+    found."""
+    if isinstance(tree, dict):
+        for k, v in tree.items():
+            if isinstance(k, str) and k.lower() in targets_lower:
+                if isinstance(v, (str, int, float)) and str(v).strip():
+                    return str(v).strip()
+            found = _find_key(v, targets_lower)
+            if found:
+                return found
+    elif isinstance(tree, list):
+        for v in tree:
+            found = _find_key(v, targets_lower)
+            if found:
+                return found
+    return ''
+
+
+def parse_gen_params_json(filepath):
+    """Extract route/direction metadata from an EXFO FastReporter JSON in the
+    same shape parse_gen_params() returns for SOR files."""
+    import json as _json
+    try:
+        with open(filepath) as fh:
+            data = _json.load(fh)
+    except Exception:
+        return {}
+
+    loc_a = _find_key(data, {'locationa', 'originatinglocation', 'locationfrom',
+                              'locationstart'})
+    loc_b = _find_key(data, {'locationb', 'terminatinglocation', 'locationto',
+                              'locationend'})
+    cable_id = _find_key(data, {'cableid', 'cable'})
+    fiber_id = _find_key(data, {'fiberid', 'fibernumber', 'fiber'})
+    cable_code = _find_key(data, {'cablecode'})
+    operator = _find_key(data, {'operator', 'user', 'technician'})
+    comment = _find_key(data, {'comment', 'comments', 'notes'})
+
+    # Wavelength code (short int matching SOR convention) — pull from the
+    # JSON, round to nearest nm.
+    wl_str = _find_key(data, {'wavelength', 'nominalwavelength'})
+    try:
+        wl_nm = int(round(float(wl_str))) if wl_str else 0
+    except ValueError:
+        wl_nm = 0
+
+    return {
+        'cable_id': cable_id,
+        'fiber_id': fiber_id,
+        'fiber_type_code': 0,
+        'wavelength_code': wl_nm,
+        'location_a': loc_a,
+        'location_b': loc_b,
+        'cable_code': cable_code,
+        'build_condition': '',
+        'operator': operator,
+        'comment': comment,
+    }
+
+
+def load_fiber_json(filepath):
+    """Parse an EXFO FastReporter JSON and return the same dict shape
+    load_fiber() returns for SOR files."""
+    from json_reader import parse_otdr_json
+    parsed = parse_otdr_json(filepath)
+    events = parsed.get('events', [])
+
+    # Fiber-start distance (first surviving event after launch trim).
+    first_dist_km = events[0]['dist_km'] if events else 0.0
+
+    # Try to recover an acquisition timestamp from anywhere in the JSON.
+    import json as _json
+    try:
+        with open(filepath) as fh:
+            raw_json = _json.load(fh)
+    except Exception:
+        raw_json = {}
+    ts_str = _find_key(raw_json, {'acquisitiondatetime', 'datetime',
+                                   'measurementdatetime', 'timestamp'})
+    ts = 0
+    if ts_str:
+        try:
+            # ISO-ish: "2026-04-21T14:32:05" or with trailing Z / offset.
+            from datetime import datetime as _dt
+            for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%SZ',
+                        '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S.%f'):
+                try:
+                    ts = int(_dt.strptime(ts_str.split('+')[0].split('.')[0],
+                                          '%Y-%m-%dT%H:%M:%S').timestamp())
+                    break
+                except ValueError:
+                    continue
+        except Exception:
+            ts = 0
+
+    evt_list = []
+    total_splice = 0.0
+    total_fiber_atten = 0.0
+    prev_km = None
+    for i, ev in enumerate(events):
+        dist_km = ev['dist_km'] - first_dist_km
+        splice = float(ev.get('splice_loss') or 0.0)
+        total_splice += splice
+        if prev_km is not None:
+            span_km = ev['dist_km'] - prev_km
+            slope_dBkm = float(ev.get('slope') or 0.0)  # already dB/km
+            total_fiber_atten += slope_dBkm * span_km
+        prev_km = ev['dist_km']
+        evt_list.append({
+            'number': ev.get('number', i),
+            'dist_km': dist_km,
+            'splice_loss': splice,
+            'splice_mdB': round(splice * 1000),
+            'reflection': float(ev.get('reflection') or 0.0),
+        })
+
+    total_loss = total_splice + total_fiber_atten
+    filesize = os.path.getsize(filepath)
+    return {
+        'events': evt_list,
+        'timestamp': ts,
+        'filesize': filesize,
+        'filename': os.path.basename(filepath),
+        'total_splice_dB': total_splice,
+        'total_fiber_atten_dB': total_fiber_atten,
+        'total_loss_dB': total_loss,
+        'total_loss_mdB': round(total_loss * 1000),
+        'gen_params': parse_gen_params_json(filepath),
+    }
+
+
+def parse_gen_params_any(filepath):
+    """Dispatch to the right metadata extractor based on file extension."""
+    if filepath.lower().endswith('.json'):
+        return parse_gen_params_json(filepath)
+    return parse_gen_params(filepath)
+
+
+def load_fiber_any(filepath):
+    """Dispatch to the right loader based on file extension."""
+    if filepath.lower().endswith('.json'):
+        return load_fiber_json(filepath)
+    return load_fiber(filepath)
+
+
 def load_fiber(filepath):
     parsed = parse_sor_with_windows(filepath)
     events = parsed['events']

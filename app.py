@@ -21,8 +21,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from report_core import (
-    load_fiber, compare_pairs, build_combined_report,
-    html_to_pdf_bytes, parse_gen_params, TOP_N,
+    load_fiber_any, compare_pairs, build_combined_report,
+    html_to_pdf_bytes, parse_gen_params_any, TOP_N,
 )
 
 
@@ -123,21 +123,16 @@ summary = f"Loaded {len(saved_paths)} file(s): {len(sor_paths)} SOR"
 if json_paths:
     summary += f", {len(json_paths)} JSON"
 if trc_paths:
-    summary += f", {len(trc_paths)} TRC"
+    summary += f", {len(trc_paths)} TRC (ignored)"
 st.success(summary + ".")
 
-if json_paths or trc_paths:
-    st.warning(
-        "JSON and TRC parsers aren't wired up yet — only SOR files will be "
-        "included in this report. (Send me a sample JSON/TRC and I'll add "
-        "support.)"
-    )
-
-if not sor_paths:
-    st.error("No SOR files found; nothing to report yet.")
+# SOR + JSON are processed; TRC is ignored per request.
+processed_paths = sor_paths + json_paths
+if not processed_paths:
+    st.error("No SOR or JSON files found; nothing to report.")
     st.stop()
 
-saved_paths = sor_paths  # downstream flow assumes SOR files
+saved_paths = processed_paths
 
 
 # ----- group files by firmware GenParams (ignore filenames) -------------
@@ -154,7 +149,7 @@ def group_by_firmware(paths):
     skipped = []
     for p in paths:
         try:
-            gp = parse_gen_params(p)
+            gp = parse_gen_params_any(p)
         except Exception:
             gp = {}
         loc_a = (gp.get('location_a') or '').strip()
@@ -189,7 +184,7 @@ if not fw_groups:
     with st.expander("Sample metadata (for debugging)", expanded=False):
         for p in saved_paths[:25]:
             try:
-                gp = parse_gen_params(p)
+                gp = parse_gen_params_any(p)
             except Exception as e:
                 gp = {'error': str(e)}
             st.text(f"{os.path.basename(p)}  →  {gp}")
@@ -215,7 +210,7 @@ def process_direction(loc_a, loc_b, wavelength, fiber_paths):
     for n in fiber_nums:
         fp = fiber_paths[n]
         try:
-            fibers[f"{n:04d}"] = load_fiber(fp)
+            fibers[f"{n:04d}"] = load_fiber_any(fp)
         except Exception as e:
             st.warning(f"Failed to parse {os.path.basename(fp)}: {e}")
     if len(fibers) < 2:
