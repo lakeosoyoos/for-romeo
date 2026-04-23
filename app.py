@@ -32,10 +32,17 @@ st.set_page_config(
 )
 
 # ----- password gate ----------------------------------------------------
-APP_PASSWORD = "3054"
+APP_PASSWORD = st.secrets.get("app_password", "") if hasattr(st, "secrets") else ""
 
 if not st.session_state.get("authed"):
     st.title("Shortened Duplicate Report")
+    if not APP_PASSWORD:
+        st.error(
+            "App password is not configured. Set `app_password` in Streamlit "
+            "Cloud → app **Settings** → **Secrets**, or in a local "
+            "`.streamlit/secrets.toml` for development."
+        )
+        st.stop()
     pwd = st.text_input("Password", type="password")
     if pwd == APP_PASSWORD:
         st.session_state["authed"] = True
