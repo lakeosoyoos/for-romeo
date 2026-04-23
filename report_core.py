@@ -281,38 +281,43 @@ def _chunked_tables(pairs, title, total_events, force_break_first=False, highlig
 
 
 def build_direction_section(pairs, direction_label, section_index=0):
-    """Build the HTML fragment for ONE direction: banner + histogram + three
-    chunked ranking tables. `section_index` > 0 puts the banner on a new
-    page via the banner's own `page-break-before`, so no extra spacer
-    elements are needed (spacers cause double breaks)."""
+    """Build the HTML fragment for ONE direction: histogram + three chunked
+    ranking tables. Direction context is carried in each ranking's h2 title
+    so we don't need a full-width banner (which could leave an orphan page
+    break on short directions). For sections after the first, the very
+    first chunk is forced onto a new page."""
     n_pairs = len(pairs)
     show_chart = n_pairs > 1
     chart_b64 = _histogram_b64(pairs, direction_label) if show_chart else ''
-    chart_html = f'<img src="data:image/png;base64,{chart_b64}" class="chart-img" />' if show_chart else ''
+    chart_html = (f'<img src="data:image/png;base64,{chart_b64}" class="chart-img" '
+                  f'style="page-break-before:always; break-before:page;" />'
+                  if show_chart and section_index > 0 else
+                  f'<img src="data:image/png;base64,{chart_b64}" class="chart-img" />'
+                  if show_chart else '')
 
     total_events = len(pairs[0]['per_event']) if pairs else 0
 
-    # First ranking: no forced break (follows chart naturally).
+    def t(label):  # prepend direction to each ranking title
+        return f'{direction_label} &mdash; {label}'
+
+    # If there is no chart for this non-first section, force the first table
+    # onto a new page instead (covers the edge case of 0/1 pair direction).
+    force_first = (section_index > 0) and (not show_chart)
+
     diff_tables = _chunked_tables(
-        pairs, 'Ranked by Smallest Splice Loss Difference', total_events,
-        highlight='diff')
-    # Second + third rankings: force the first chunk onto a fresh page.
+        pairs, t('Ranked by Smallest Splice Loss Difference'), total_events,
+        force_break_first=force_first, highlight='diff')
     time_sorted = sorted([p for p in pairs if p.get('time_gap_sec') is not None],
                          key=lambda x: x['time_gap_sec'])
     time_tables = _chunked_tables(
-        time_sorted, 'Ranked by Shortest Time Gap', total_events,
+        time_sorted, t('Ranked by Shortest Time Gap'), total_events,
         force_break_first=True, highlight='gap')
     loss_sorted = sorted(pairs, key=lambda x: x.get('total_loss_diff', 999))
     loss_tables = _chunked_tables(
-        loss_sorted, 'Ranked by Smallest Total Loss Difference', total_events,
+        loss_sorted, t('Ranked by Smallest Total Loss Difference'), total_events,
         force_break_first=True, highlight='total')
 
-    banner_break = ('style="page-break-before:always; break-before:page;"'
-                    if section_index > 0 else '')
-
     return f'''
-<div class="dir-banner" {banner_break}>Direction: {direction_label}</div>
-
 {chart_html}
 
 {diff_tables}
