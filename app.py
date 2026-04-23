@@ -116,20 +116,45 @@ st.success(f"Loaded {len(saved_paths)} SOR file(s).")
 
 # ----- group files by (prefix, suffix) = direction ----------------------
 def group_by_direction(filenames):
-    groups = defaultdict(dict)
+    """Handle names like `DNWRCH-A-271.sor` and `LSC1LSC60001_1550.sor`
+    (wavelength suffix) alike. For each file, enumerate every digit run in
+    the stem as a candidate fiber-number position. Then rank (prefix, suffix)
+    tuples by how many files share them — the best-scoring tuple for each
+    file is the one we use. A wavelength suffix like `_1550` shows up in
+    every file's best tuple, so it's correctly treated as part of the
+    suffix rather than the fiber number."""
+    per_file_options = []  # list of list[(pre, suf, num, base)]
     for fn in filenames:
         base = os.path.basename(fn)
         if not base.lower().endswith(".sor"):
             continue
         stem = base[:-4]
-        m = None
-        for candidate in re.finditer(r"\d+", stem):
-            m = candidate
-        if not m:
+        options = []
+        for m in re.finditer(r"\d+", stem):
+            pre = stem[: m.start()]
+            suf = stem[m.end():]
+            num = int(m.group(0))
+            options.append((pre, suf, num, base))
+        if options:
+            per_file_options.append(options)
+
+    # Score each (prefix, suffix) by how many files mention it at all.
+    tuple_counts = Counter()
+    for options in per_file_options:
+        # Each file may list the same (pre, suf) only once naturally, but
+        # dedupe just in case.
+        for pre, suf, _, _ in set((o[0], o[1]) for o in options):
+            tuple_counts[(pre, suf)] += 1
+
+    # For each file, assign it to the highest-scoring tuple available for it.
+    groups = defaultdict(dict)
+    for options in per_file_options:
+        best = max(options, key=lambda o: tuple_counts[(o[0], o[1])])
+        pre, suf, num, base = best
+        # Only accept assignments where the shared-tuple count is >= 2
+        # (avoids attaching a stray single-file interpretation to a group).
+        if tuple_counts[(pre, suf)] < 2:
             continue
-        pre = stem[: m.start()]
-        suf = stem[m.end():]
-        num = int(m.group(0))
         groups[(pre, suf)][num] = base
     return groups
 
@@ -142,6 +167,9 @@ if not groups:
         "Could not find any prefix with ≥2 fibers. Check that the uploaded "
         "files share a consistent naming pattern."
     )
+    with st.expander("Sample filenames (for debugging)", expanded=False):
+        for p in saved_paths[:25]:
+            st.text(os.path.basename(p))
     st.stop()
 
 
