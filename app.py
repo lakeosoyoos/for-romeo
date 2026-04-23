@@ -31,6 +31,19 @@ st.set_page_config(
     layout="wide",
 )
 
+# ----- password gate ----------------------------------------------------
+APP_PASSWORD = "3054"
+
+if not st.session_state.get("authed"):
+    st.title("Shortened Duplicate Report")
+    pwd = st.text_input("Password", type="password")
+    if pwd == APP_PASSWORD:
+        st.session_state["authed"] = True
+        st.rerun()
+    elif pwd:
+        st.error("Incorrect password.")
+    st.stop()
+
 st.title("Shortened Duplicate Report (with Loss)")
 st.caption(
     "Upload a .zip of SOR files or the .sor files directly. The app detects "
