@@ -22,7 +22,7 @@ sys.path.insert(0, HERE)
 
 from report_core import (
     load_fiber, compare_pairs, build_combined_report,
-    html_to_pdf_bytes, TOP_N,
+    html_to_pdf_bytes, parse_gen_params, TOP_N,
 )
 
 
@@ -61,8 +61,8 @@ st.caption(
 
 # ----- upload -----------------------------------------------------------
 uploads = st.file_uploader(
-    "Drop .sor files and/or a .zip here",
-    type=["sor", "zip"],
+    "Drop .sor, .json, .trc files and/or a .zip here",
+    type=["sor", "json", "trc", "zip"],
     accept_multiple_files=True,
 )
 
@@ -73,6 +73,9 @@ if not uploads:
 
 # ----- stash uploads to a temp dir --------------------------------------
 tmp_dir = tempfile.mkdtemp(prefix="romeo_sor_")
+
+
+SUPPORTED_EXTS = (".sor", ".json", ".trc")
 
 
 def _extract(uf, dest_dir):
@@ -88,7 +91,7 @@ def _extract(uf, dest_dir):
                 if info.is_dir():
                     continue
                 inner = os.path.basename(info.filename)
-                if not inner.lower().endswith(".sor"):
+                if not inner.lower().endswith(SUPPORTED_EXTS):
                     continue
                 dst = os.path.join(dest_dir, inner)
                 with zf.open(info) as src, open(dst, "wb") as out:
@@ -108,69 +111,92 @@ for uf in uploads:
     saved_paths.extend(_extract(uf, tmp_dir))
 
 if not saved_paths:
-    st.error("No .sor files found in the uploads.")
+    st.error("No .sor / .json / .trc files found in the uploads.")
     st.stop()
 
-st.success(f"Loaded {len(saved_paths)} SOR file(s).")
+# Partition by extension.
+sor_paths = [p for p in saved_paths if p.lower().endswith(".sor")]
+json_paths = [p for p in saved_paths if p.lower().endswith(".json")]
+trc_paths = [p for p in saved_paths if p.lower().endswith(".trc")]
 
+summary = f"Loaded {len(saved_paths)} file(s): {len(sor_paths)} SOR"
+if json_paths:
+    summary += f", {len(json_paths)} JSON"
+if trc_paths:
+    summary += f", {len(trc_paths)} TRC"
+st.success(summary + ".")
 
-# ----- group files by (prefix, suffix) = direction ----------------------
-def group_by_direction(filenames):
-    """Handle names like `DNWRCH-A-271.sor` and `LSC1LSC60001_1550.sor`
-    (wavelength suffix) alike. For each file, enumerate every digit run in
-    the stem as a candidate fiber-number position. Then rank (prefix, suffix)
-    tuples by how many files share them — the best-scoring tuple for each
-    file is the one we use. A wavelength suffix like `_1550` shows up in
-    every file's best tuple, so it's correctly treated as part of the
-    suffix rather than the fiber number."""
-    per_file_options = []  # list of list[(pre, suf, num, base)]
-    for fn in filenames:
-        base = os.path.basename(fn)
-        if not base.lower().endswith(".sor"):
-            continue
-        stem = base[:-4]
-        options = []
-        for m in re.finditer(r"\d+", stem):
-            pre = stem[: m.start()]
-            suf = stem[m.end():]
-            num = int(m.group(0))
-            options.append((pre, suf, num, base))
-        if options:
-            per_file_options.append(options)
-
-    # Score each (prefix, suffix) by how many files mention it at all.
-    tuple_counts = Counter()
-    for options in per_file_options:
-        # Each file may list the same (pre, suf) only once naturally, but
-        # dedupe just in case.
-        for pre, suf, _, _ in set((o[0], o[1]) for o in options):
-            tuple_counts[(pre, suf)] += 1
-
-    # For each file, assign it to the highest-scoring tuple available for it.
-    groups = defaultdict(dict)
-    for options in per_file_options:
-        best = max(options, key=lambda o: tuple_counts[(o[0], o[1])])
-        pre, suf, num, base = best
-        # Only accept assignments where the shared-tuple count is >= 2
-        # (avoids attaching a stray single-file interpretation to a group).
-        if tuple_counts[(pre, suf)] < 2:
-            continue
-        groups[(pre, suf)][num] = base
-    return groups
-
-
-groups = group_by_direction([os.path.basename(p) for p in saved_paths])
-groups = {k: v for k, v in groups.items() if len(v) >= 2}
-
-if not groups:
-    st.error(
-        "Could not find any prefix with ≥2 fibers. Check that the uploaded "
-        "files share a consistent naming pattern."
+if json_paths or trc_paths:
+    st.warning(
+        "JSON and TRC parsers aren't wired up yet — only SOR files will be "
+        "included in this report. (Send me a sample JSON/TRC and I'll add "
+        "support.)"
     )
-    with st.expander("Sample filenames (for debugging)", expanded=False):
-        for p in saved_paths[:25]:
-            st.text(os.path.basename(p))
+
+if not sor_paths:
+    st.error("No SOR files found; nothing to report yet.")
     st.stop()
+
+saved_paths = sor_paths  # downstream flow assumes SOR files
+
+
+# ----- group files by firmware GenParams (ignore filenames) -------------
+def group_by_firmware(paths):
+    """Read GenParams from each SOR file and group by (location_a,
+    location_b, wavelength_code). Fiber number comes from fiber_id; if
+    fiber_id is non-numeric we fall back to the first digit run in the
+    filename so the file is still usable.
+
+    Returns (groups, skipped) where groups is
+        { (loc_a, loc_b, wavelength): { fiber_num: abs_path } }.
+    """
+    groups = defaultdict(dict)
+    skipped = []
+    for p in paths:
+        try:
+            gp = parse_gen_params(p)
+        except Exception:
+            gp = {}
+        loc_a = (gp.get('location_a') or '').strip()
+        loc_b = (gp.get('location_b') or '').strip()
+        fiber_id_raw = (gp.get('fiber_id') or '').strip()
+        wl = gp.get('wavelength_code', 0) or 0
+
+        digits_from_id = re.sub(r'\D', '', fiber_id_raw)
+        fnum = int(digits_from_id) if digits_from_id else None
+        if fnum is None:
+            m = re.search(r'\d+', os.path.basename(p))
+            fnum = int(m.group(0)) if m else None
+
+        if fnum is None or not (loc_a and loc_b):
+            skipped.append((p, gp))
+            continue
+        groups[(loc_a, loc_b, wl)][fnum] = p
+    return groups, skipped
+
+
+with st.spinner(f"Reading firmware metadata from {len(saved_paths)} files…"):
+    fw_groups, skipped = group_by_firmware(saved_paths)
+
+fw_groups = {k: v for k, v in fw_groups.items() if len(v) >= 2}
+
+if not fw_groups:
+    st.error(
+        "Could not find any direction with ≥2 fibers from firmware metadata "
+        "(GenParams location_a / location_b / fiber_id). "
+        f"{len(skipped)} file(s) lacked usable metadata."
+    )
+    with st.expander("Sample metadata (for debugging)", expanded=False):
+        for p in saved_paths[:25]:
+            try:
+                gp = parse_gen_params(p)
+            except Exception as e:
+                gp = {'error': str(e)}
+            st.text(f"{os.path.basename(p)}  →  {gp}")
+    st.stop()
+
+if skipped:
+    st.warning(f"Skipped {len(skipped)} file(s) missing firmware metadata.")
 
 
 # ----- parse each direction ---------------------------------------------
@@ -181,26 +207,26 @@ def pick_common(values):
     return Counter(vals).most_common(1)[0][0]
 
 
-def process_direction(prefix, suffix, fiber_map):
-    fiber_nums = sorted(fiber_map.keys())
+def process_direction(loc_a, loc_b, wavelength, fiber_paths):
+    """fiber_paths: {fiber_num: absolute_path}. Parse every file and build
+    the direction record."""
+    fiber_nums = sorted(fiber_paths.keys())
     fibers = {}
     for n in fiber_nums:
-        fp = os.path.join(tmp_dir, fiber_map[n])
+        fp = fiber_paths[n]
         try:
             fibers[f"{n:04d}"] = load_fiber(fp)
         except Exception as e:
-            st.warning(f"Failed to parse {fiber_map[n]}: {e}")
+            st.warning(f"Failed to parse {os.path.basename(fp)}: {e}")
     if len(fibers) < 2:
         return None
 
     gp_list = [fibers[k].get('gen_params', {}) or {} for k in fibers]
-    loc_a = pick_common([g.get('location_a', '') for g in gp_list])
-    loc_b = pick_common([g.get('location_b', '') for g in gp_list])
     cable_id = pick_common([g.get('cable_id', '') for g in gp_list])
     cable_code = pick_common([g.get('cable_code', '') for g in gp_list])
-    clean_prefix = prefix.rstrip("-_ ") or "Route"
-    label = f"{loc_a} → {loc_b}" if loc_a and loc_b else clean_prefix
-    route_hint = cable_id or cable_code or clean_prefix
+    label_base = f"{loc_a} → {loc_b}"
+    label = f"{label_base} @ {wavelength}nm" if wavelength else label_base
+    route_hint = cable_id or cable_code or 'Route'
 
     pairs = compare_pairs(fibers)
     return {
@@ -209,14 +235,15 @@ def process_direction(prefix, suffix, fiber_map):
         'fiber_nums': fiber_nums,
         'route_hint': route_hint,
         'loc_a': loc_a, 'loc_b': loc_b,
-        'prefix': prefix,
+        'wavelength': wavelength,
     }
 
 
 directions = []
-for (pre, suf), fiber_map in groups.items():
-    with st.spinner(f"Parsing {len(fiber_map)} fibers from '{pre or '∅'}'…"):
-        d = process_direction(pre, suf, fiber_map)
+for (loc_a, loc_b, wl), fiber_paths in fw_groups.items():
+    with st.spinner(f"Parsing {len(fiber_paths)} fibers for {loc_a} → {loc_b}"
+                    + (f" @ {wl}nm" if wl else "") + "…"):
+        d = process_direction(loc_a, loc_b, wl, fiber_paths)
     if d is not None:
         directions.append(d)
 
@@ -224,18 +251,8 @@ if not directions:
     st.error("No direction had at least 2 parseable fibers.")
     st.stop()
 
-# If two directions ended up with the same GenParams label (firmware quirk
-# where A/B locations don't match the filename convention), fall back to
-# the cleaned filename prefix so sections are distinguishable.
-label_counts = Counter(d['label'] for d in directions)
-collisions = {label for label, c in label_counts.items() if c > 1}
-for d in directions:
-    if d['label'] in collisions:
-        clean = d['prefix'].rstrip('-_ ') or 'Direction'
-        if d['loc_a'] and d['loc_b']:
-            d['label'] = f"{clean} ({d['loc_a']} → {d['loc_b']})"
-        else:
-            d['label'] = clean
+# Sort directions for consistent output: by wavelength then A→B alphabetical.
+directions.sort(key=lambda d: (d['wavelength'], d['loc_a'], d['loc_b']))
 
 
 # ----- derive a single route name across all directions ----------------
