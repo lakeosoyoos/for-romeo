@@ -51,7 +51,7 @@ if not st.session_state.get("authed"):
         st.error("Incorrect password.")
     st.stop()
 
-st.title("Shortened Duplicate Report (with Loss)")
+st.title("Shortened Duplicate Report")
 st.caption(
     "Upload a .zip of SOR files or the .sor files directly. The app detects "
     "every distinct filename prefix, treats each one as a direction, and "
