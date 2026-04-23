@@ -174,12 +174,20 @@ def _histogram_b64(pairs, title_str):
 EVENTS_PER_CHUNK = 5
 
 
-def _rows(pairs, top_n, event_start, event_end, include_total):
+RED_STYLE = 'color:#C0392B;font-weight:700'
+
+
+def _rows(pairs, top_n, event_start, event_end, include_total, highlight=None):
     """Render rows for a given slice of events.
 
     event_start / event_end: half-open indices into each pair's per_event list.
-    include_total: whether to append the 3 total-loss columns on the right.
+    include_total:  whether to append the 3 total-loss columns on the right.
+    highlight: which ranking column to paint red across every row. One of
+        None, 'diff' (Max Diff), 'gap' (Time Gap), or 'total' (Total Loss Δ).
     """
+    diff_style = RED_STYLE if highlight == 'diff' else 'font-weight:600'
+    total_style = RED_STYLE if highlight == 'total' else 'font-weight:600'
+
     out = ''
     for rank, p in enumerate(pairs[:top_n], 1):
         a, b = p['fiber_a'], p['fiber_b']
@@ -189,13 +197,16 @@ def _rows(pairs, top_n, event_start, event_end, include_total):
         gap = p.get('time_gap_sec')
         if gap is not None:
             if gap < 120:
-                gap_str, gap_cls = f'{gap:.0f}s', ' style="color:#C0392B;font-weight:700"'
+                gap_str = f'{gap:.0f}s'
             elif gap < 3600:
-                gap_str, gap_cls = f'{gap/60:.0f}m', ''
+                gap_str = f'{gap/60:.0f}m'
             else:
-                gap_str, gap_cls = f'{gap/3600:.1f}h', ''
+                gap_str = f'{gap/3600:.1f}h'
         else:
-            gap_str, gap_cls = '---', ''
+            gap_str = '---'
+        gap_style = RED_STYLE if highlight == 'gap' else ''
+        gap_attr = f' style="{gap_style}"' if gap_style else ''
+
         evt_cells = ''
         for pe in p['per_event'][event_start:event_end]:
             evt_cells += (f'<td class="center">{pe["loss_a"]:+.3f}</td>'
@@ -208,14 +219,14 @@ def _rows(pairs, top_n, event_start, event_end, include_total):
             loss_diff = p.get('total_loss_diff', 0)
             total_cells = (f'<td class="center">{loss_a}</td>'
                            f'<td class="center">{loss_b}</td>'
-                           f'<td class="center" style="font-weight:600">{loss_diff}</td>')
+                           f'<td class="center" style="{total_style}">{loss_diff}</td>')
         out += (f'<tr>'
                 f'<td class="center">{rank}</td>'
                 f'<td class="pair-cell">{a} &#8596; {b}</td>'
-                f'<td class="center bold">{diff:.0f}</td>'
+                f'<td class="center" style="{diff_style}">{diff:.0f}</td>'
                 f'<td class="center" style="font-size:8px">{ts_a_str}</td>'
                 f'<td class="center" style="font-size:8px">{ts_b_str}</td>'
-                f'<td class="center"{gap_cls}>{gap_str}</td>'
+                f'<td class="center"{gap_attr}>{gap_str}</td>'
                 f'{evt_cells}'
                 f'{total_cells}'
                 f'</tr>\n')
@@ -235,7 +246,7 @@ def _evt_headers(pairs, event_start, event_end, include_total):
     return h, s
 
 
-def _chunked_tables(pairs, title, total_events, force_break_first=False):
+def _chunked_tables(pairs, title, total_events, force_break_first=False, highlight=None):
     """Build one `<div class='table-section'>` per event chunk. First chunk
     uses `title`; subsequent chunks append " (cont.)". Chunks after the first
     always start on a new page; the first chunk starts a new page only if
@@ -250,7 +261,7 @@ def _chunked_tables(pairs, title, total_events, force_break_first=False):
         is_last = (i == len(starts) - 1)
         chunk_title = title if i == 0 else f'{title} (cont. events {s+1}&ndash;{e})'
         evt_h, evt_s = _evt_headers(pairs, s, e, include_total=is_last)
-        rows_html = _rows(pairs, TOP_N, s, e, include_total=is_last)
+        rows_html = _rows(pairs, TOP_N, s, e, include_total=is_last, highlight=highlight)
         needs_break = (i > 0) or force_break_first
         page_break = 'style="page-break-before:always; break-before:page;"' if needs_break else ''
         blocks.append(f'''
@@ -283,17 +294,18 @@ def build_direction_section(pairs, direction_label, section_index=0):
 
     # First ranking: no forced break (follows chart naturally).
     diff_tables = _chunked_tables(
-        pairs, 'Ranked by Smallest Splice Loss Difference', total_events)
+        pairs, 'Ranked by Smallest Splice Loss Difference', total_events,
+        highlight='diff')
     # Second + third rankings: force the first chunk onto a fresh page.
     time_sorted = sorted([p for p in pairs if p.get('time_gap_sec') is not None],
                          key=lambda x: x['time_gap_sec'])
     time_tables = _chunked_tables(
         time_sorted, 'Ranked by Shortest Time Gap', total_events,
-        force_break_first=True)
+        force_break_first=True, highlight='gap')
     loss_sorted = sorted(pairs, key=lambda x: x.get('total_loss_diff', 999))
     loss_tables = _chunked_tables(
         loss_sorted, 'Ranked by Smallest Total Loss Difference', total_events,
-        force_break_first=True)
+        force_break_first=True, highlight='total')
 
     banner_break = ('style="page-break-before:always; break-before:page;"'
                     if section_index > 0 else '')
