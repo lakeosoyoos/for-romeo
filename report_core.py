@@ -131,6 +131,69 @@ def parse_gen_params_json(filepath):
     }
 
 
+def debug_timestamp_candidates(filepath):
+    """Walk a JSON file and return every (dotted-path, value) where the key
+    looks like it might be a date or time. For troubleshooting when
+    timestamps show blank."""
+    import json as _json
+    try:
+        with open(filepath) as fh:
+            data = _json.load(fh)
+    except Exception as e:
+        return [('<parse error>', str(e))]
+    hits = []
+    needles = ('date', 'time', 'timestamp', 'acqui', 'measure')
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                key_lower = str(k).lower()
+                if any(n in key_lower for n in needles) and isinstance(v, (str, int, float)):
+                    hits.append((f'{path}.{k}' if path else k, v))
+                walk(v, f'{path}.{k}' if path else k)
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                walk(v, f'{path}[{i}]')
+    walk(data, '')
+    return hits
+
+
+def _parse_iso_to_unix(s):
+    """Best-effort convert an ISO/datetime-ish string (or numeric string) to a
+    Unix timestamp int. Returns 0 on failure."""
+    if s is None:
+        return 0
+    s = str(s).strip()
+    if not s:
+        return 0
+    # Pure numeric → unix timestamp (allow float/int).
+    try:
+        if s.replace('.', '', 1).lstrip('-').isdigit():
+            return int(float(s))
+    except Exception:
+        pass
+    from datetime import datetime as _dt
+    # Normalize trailing 'Z' to +00:00 so fromisoformat can handle it.
+    s_norm = s
+    if s_norm.endswith(('Z', 'z')):
+        s_norm = s_norm[:-1] + '+00:00'
+    try:
+        return int(_dt.fromisoformat(s_norm).timestamp())
+    except Exception:
+        pass
+    # Fallback: strip timezone/fraction and try common strptime formats.
+    core = s.split('+')[0].rstrip('Zz').split('.')[0].strip()
+    for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S',
+                '%Y-%m-%dT%H:%M', '%Y-%m-%d %H:%M',
+                '%m/%d/%Y %H:%M:%S', '%m/%d/%Y %H:%M',
+                '%Y-%m-%d', '%m/%d/%Y'):
+        try:
+            return int(_dt.strptime(core, fmt).timestamp())
+        except ValueError:
+            continue
+    return 0
+
+
 def load_fiber_json(filepath):
     """Parse an EXFO FastReporter JSON and return the same dict shape
     load_fiber() returns for SOR files."""
@@ -148,23 +211,13 @@ def load_fiber_json(filepath):
             raw_json = _json.load(fh)
     except Exception:
         raw_json = {}
-    ts_str = _find_key(raw_json, {'acquisitiondatetime', 'datetime',
-                                   'measurementdatetime', 'timestamp'})
-    ts = 0
-    if ts_str:
-        try:
-            # ISO-ish: "2026-04-21T14:32:05" or with trailing Z / offset.
-            from datetime import datetime as _dt
-            for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%SZ',
-                        '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S.%f'):
-                try:
-                    ts = int(_dt.strptime(ts_str.split('+')[0].split('.')[0],
-                                          '%Y-%m-%dT%H:%M:%S').timestamp())
-                    break
-                except ValueError:
-                    continue
-        except Exception:
-            ts = 0
+    ts_str = _find_key(raw_json, {
+        'acquisitiondatetime', 'acquisitiondate', 'acquisitiontime',
+        'measurementdatetime', 'measurementdate', 'measurementtime',
+        'datetime', 'timestamp', 'startdatetime', 'starttime',
+        'date', 'time', 'datetimeacquired',
+    })
+    ts = _parse_iso_to_unix(ts_str)
 
     evt_list = []
     total_splice = 0.0
