@@ -61,11 +61,29 @@ st.caption(
 )
 
 # ----- upload -----------------------------------------------------------
-uploads = st.file_uploader(
-    "Drop .sor, .json, .trc files and/or a .zip here",
-    type=["sor", "json", "trc", "zip"],
-    accept_multiple_files=True,
-)
+# Nonce is appended to the uploader's key so pressing "Clear" forces a fresh
+# widget, which drops the currently-uploaded files from Streamlit's state.
+if "uploader_nonce" not in st.session_state:
+    st.session_state["uploader_nonce"] = 0
+
+up_col, btn_col = st.columns([5, 1])
+with up_col:
+    uploads = st.file_uploader(
+        "Drop .sor, .json, .trc files and/or a .zip here",
+        type=["sor", "json", "trc", "zip"],
+        accept_multiple_files=True,
+        key=f"uploader_{st.session_state['uploader_nonce']}",
+    )
+with btn_col:
+    st.write("")  # vertical spacer so the button aligns with the uploader
+    st.write("")
+    if st.button("Clear", use_container_width=True):
+        # Wipe cached render outputs and bump the uploader nonce so the
+        # file_uploader widget is recreated empty.
+        for k in ("pdf_bytes", "pdf_html"):
+            st.session_state.pop(k, None)
+        st.session_state["uploader_nonce"] += 1
+        st.rerun()
 
 if not uploads:
     st.info("Waiting for files…")
