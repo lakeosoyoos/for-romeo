@@ -149,15 +149,43 @@ if not processed_paths:
 saved_paths = processed_paths
 
 
-# ----- group files by firmware GenParams (ignore filenames) -------------
-def group_by_firmware(paths):
-    """Read GenParams from each SOR file and group by (location_a,
-    location_b, wavelength_code). Fiber number comes from fiber_id; if
-    fiber_id is non-numeric we fall back to the first digit run in the
-    filename so the file is still usable.
+# ----- group files by firmware GenParams (fallback to filename) --------
+def _filename_prefix_key(path, fiber_num=None):
+    """Return the filename prefix preceding the fiber number. If `fiber_num`
+    is given, we find the digit run that matches it (so a trailing wavelength
+    suffix like `_1550` can't be mistaken for the fiber number). Otherwise we
+    use the FIRST digit run in the stem, not the last."""
+    base = os.path.basename(path)
+    # Strip extension (.sor / .json / .trc)
+    stem, _, ext = base.rpartition('.')
+    if not stem:
+        stem = base
+    matches = list(re.finditer(r'\d+', stem))
+    if not matches:
+        return stem.rstrip('-_ ') or 'Route'
+    chosen = None
+    if fiber_num is not None:
+        for m in matches:
+            if int(m.group(0)) == fiber_num:
+                chosen = m
+                break
+    if chosen is None:
+        chosen = matches[0]
+    return stem[: chosen.start()].rstrip('-_ ') or 'Route'
 
-    Returns (groups, skipped) where groups is
-        { (loc_a, loc_b, wavelength): { fiber_num: abs_path } }.
+
+def group_by_firmware(paths):
+    """Read GenParams from each file and group by
+        (location_a, location_b, wavelength)
+    when both locations are populated. Otherwise fall back to the filename
+    prefix so files without OTDR location metadata still group by direction.
+
+    Fiber number: GenParams `fiber_id` digits first, else the first digit
+    run in the filename.
+
+    Returns (groups, skipped). `groups` maps (key_a, key_b, wavelength) to
+    {fiber_num: abs_path}. When the fallback is used, (key_a, key_b) is
+    (prefix, '<fromfilename>') so it's visually distinguishable in the UI.
     """
     groups = defaultdict(dict)
     skipped = []
@@ -177,10 +205,20 @@ def group_by_firmware(paths):
             m = re.search(r'\d+', os.path.basename(p))
             fnum = int(m.group(0)) if m else None
 
-        if fnum is None or not (loc_a and loc_b):
+        if fnum is None:
             skipped.append((p, gp))
             continue
-        groups[(loc_a, loc_b, wl)][fnum] = p
+
+        if loc_a and loc_b:
+            key = (loc_a, loc_b, wl)
+        else:
+            # Fall back to the filename prefix so TEST-style files still form
+            # one direction per prefix. Passing `fnum` lets the prefix
+            # extractor skip wavelength suffixes like "_1550".
+            prefix = _filename_prefix_key(p, fiber_num=fnum)
+            key = (prefix, '<fromfilename>', wl)
+
+        groups[key][fnum] = p
     return groups, skipped
 
 
@@ -216,6 +254,9 @@ def pick_common(values):
     return Counter(vals).most_common(1)[0][0]
 
 
+FALLBACK_SENTINEL = '<fromfilename>'
+
+
 def process_direction(loc_a, loc_b, wavelength, fiber_paths):
     """fiber_paths: {fiber_num: absolute_path}. Parse every file and build
     the direction record."""
@@ -233,9 +274,17 @@ def process_direction(loc_a, loc_b, wavelength, fiber_paths):
     gp_list = [fibers[k].get('gen_params', {}) or {} for k in fibers]
     cable_id = pick_common([g.get('cable_id', '') for g in gp_list])
     cable_code = pick_common([g.get('cable_code', '') for g in gp_list])
-    label_base = f"{loc_a} → {loc_b}"
+
+    if loc_b == FALLBACK_SENTINEL:
+        # loc_a is actually the filename prefix.
+        label_base = loc_a or 'Unnamed'
+        loc_a_display, loc_b_display = label_base, ''
+    else:
+        label_base = f"{loc_a} → {loc_b}"
+        loc_a_display, loc_b_display = loc_a, loc_b
+
     label = f"{label_base} @ {wavelength}nm" if wavelength else label_base
-    route_hint = cable_id or cable_code or 'Route'
+    route_hint = cable_id or cable_code or loc_a_display or 'Route'
 
     pairs = compare_pairs(fibers)
     return {
@@ -243,7 +292,7 @@ def process_direction(loc_a, loc_b, wavelength, fiber_paths):
         'pairs': pairs,
         'fiber_nums': fiber_nums,
         'route_hint': route_hint,
-        'loc_a': loc_a, 'loc_b': loc_b,
+        'loc_a': loc_a_display, 'loc_b': loc_b_display,
         'wavelength': wavelength,
     }
 
@@ -260,7 +309,8 @@ if json_in_groups:
 
 directions = []
 for (loc_a, loc_b, wl), fiber_paths in fw_groups.items():
-    with st.spinner(f"Parsing {len(fiber_paths)} fibers for {loc_a} → {loc_b}"
+    label_disp = (loc_a if loc_b == FALLBACK_SENTINEL else f"{loc_a} → {loc_b}")
+    with st.spinner(f"Parsing {len(fiber_paths)} fibers for {label_disp}"
                     + (f" @ {wl}nm" if wl else "") + "…"):
         d = process_direction(loc_a, loc_b, wl, fiber_paths)
     if d is not None:
