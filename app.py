@@ -346,6 +346,38 @@ if st.session_state.get("pdf_html") != html:
 safe_route = re.sub(r"[^A-Za-z0-9]+", "_", route_name).strip("_") or "route"
 fname = f"{safe_route}_bidir_shortened.pdf"
 
+# Style the download button to look like Streamlit's green success alert:
+# darker green semi-transparent background, lime-green text, full-width bar.
+st.markdown(
+    """
+    <style>
+    [data-testid="stDownloadButton"] > button {
+        background-color: rgba(33, 195, 84, 0.16) !important;
+        color: rgb(33, 195, 84) !important;
+        border: 1px solid rgba(33, 195, 84, 0.30) !important;
+        border-radius: 0.5rem !important;
+        padding: 0.75rem 1rem !important;
+        width: 100% !important;
+        font-weight: 500 !important;
+        transition: background-color 0.15s ease, border-color 0.15s ease;
+    }
+    [data-testid="stDownloadButton"] > button:hover {
+        background-color: rgba(33, 195, 84, 0.26) !important;
+        border-color: rgba(33, 195, 84, 0.55) !important;
+        color: rgb(33, 195, 84) !important;
+    }
+    [data-testid="stDownloadButton"] > button:focus,
+    [data-testid="stDownloadButton"] > button:active {
+        background-color: rgba(33, 195, 84, 0.30) !important;
+        color: rgb(33, 195, 84) !important;
+        box-shadow: none !important;
+        outline: none !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.download_button(
     "Download combined PDF",
     data=st.session_state["pdf_bytes"],
