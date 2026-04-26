@@ -22,7 +22,7 @@ sys.path.insert(0, HERE)
 
 from report_core import (
     load_fiber_records, compare_pairs, build_combined_report,
-    html_to_pdf_bytes, debug_timestamp_candidates, TOP_N,
+    html_to_pdf_bytes, TOP_N,
 )
 
 
@@ -281,15 +281,6 @@ def process_direction(loc_a, loc_b, wavelength, fiber_records):
         'wavelength': wavelength,
     }
 
-
-# If any JSON files were uploaded, surface a debug view of their timestamp
-# keys so we can confirm they're being parsed. Collapsed by default.
-if json_paths:
-    first_json = json_paths[0]
-    with st.expander(f"Debug: timestamp keys in first JSON file "
-                     f"({os.path.basename(first_json)})", expanded=False):
-        for path, value in debug_timestamp_candidates(first_json)[:40]:
-            st.text(f"  {path}  =  {value!r}")
 
 directions = []
 for (loc_a, loc_b, wl), fiber_records in fw_groups.items():
