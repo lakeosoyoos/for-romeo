@@ -211,13 +211,23 @@ def load_fiber_json(filepath):
             raw_json = _json.load(fh)
     except Exception:
         raw_json = {}
-    ts_str = _find_key(raw_json, {
-        'acquisitiondatetime', 'acquisitiondate', 'acquisitiontime',
-        'measurementdatetime', 'measurementdate', 'measurementtime',
-        'datetime', 'timestamp', 'startdatetime', 'starttime',
-        'date', 'time', 'datetimeacquired',
-    })
-    ts = _parse_iso_to_unix(ts_str)
+    # Try strongest acquisition-time keys first; fall back to weaker ones.
+    # EXFO FastReporter uses `TestDateTime` (sometimes nested under
+    # Measurement.OtdrMeasurements[0]); other firmware variants may use
+    # AcquisitionDateTime / MeasurementDateTime / DateTime / etc.
+    ts = 0
+    for keyset in (
+        {'testdatetime', 'acquisitiondatetime', 'measurementdatetime'},
+        {'acquisitiondate', 'acquisitiontime',
+         'measurementdate', 'measurementtime',
+         'datetime', 'startdatetime', 'starttime',
+         'datetimeacquired', 'lastchangedate'},
+        {'timestamp', 'date', 'time'},
+    ):
+        ts_str = _find_key(raw_json, keyset)
+        ts = _parse_iso_to_unix(ts_str)
+        if ts:
+            break
 
     evt_list = []
     total_splice = 0.0
