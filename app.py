@@ -67,8 +67,8 @@ if "uploader_nonce" not in st.session_state:
     st.session_state["uploader_nonce"] = 0
 
 uploads = st.file_uploader(
-    "Drop .sor, .json, .trc files and/or a .zip here",
-    type=["sor", "json", "trc", "zip"],
+    "Drop .sor, .json files and/or a .zip here",
+    type=["sor", "json", "zip"],
     accept_multiple_files=True,
     key=f"uploader_{st.session_state['uploader_nonce']}",
 )
@@ -89,7 +89,7 @@ if not uploads:
 tmp_dir = tempfile.mkdtemp(prefix="romeo_sor_")
 
 
-SUPPORTED_EXTS = (".sor", ".json", ".trc")
+SUPPORTED_EXTS = (".sor", ".json")
 
 
 def _extract(uf, dest_dir):
@@ -125,22 +125,18 @@ for uf in uploads:
     saved_paths.extend(_extract(uf, tmp_dir))
 
 if not saved_paths:
-    st.error("No .sor / .json / .trc files found in the uploads.")
+    st.error("No .sor or .json files found in the uploads.")
     st.stop()
 
 # Partition by extension.
 sor_paths = [p for p in saved_paths if p.lower().endswith(".sor")]
 json_paths = [p for p in saved_paths if p.lower().endswith(".json")]
-trc_paths = [p for p in saved_paths if p.lower().endswith(".trc")]
 
 summary = f"Loaded {len(saved_paths)} file(s): {len(sor_paths)} SOR"
 if json_paths:
     summary += f", {len(json_paths)} JSON"
-if trc_paths:
-    summary += f", {len(trc_paths)} TRC (ignored)"
 st.success(summary + ".")
 
-# SOR + JSON are processed; TRC is ignored per request.
 processed_paths = sor_paths + json_paths
 if not processed_paths:
     st.error("No SOR or JSON files found; nothing to report.")
