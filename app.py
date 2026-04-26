@@ -21,9 +21,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from report_core import (
-    load_fiber_any, compare_pairs, build_combined_report,
-    html_to_pdf_bytes, parse_gen_params_any, debug_timestamp_candidates,
-    TOP_N,
+    load_fiber_records, compare_pairs, build_combined_report,
+    html_to_pdf_bytes, debug_timestamp_candidates, TOP_N,
 )
 
 
@@ -67,8 +66,8 @@ if "uploader_nonce" not in st.session_state:
     st.session_state["uploader_nonce"] = 0
 
 uploads = st.file_uploader(
-    "Drop .sor, .json files and/or a .zip here",
-    type=["sor", "json", "zip"],
+    "Drop .sor, .json, .trc files and/or a .zip here",
+    type=["sor", "json", "trc", "zip"],
     accept_multiple_files=True,
     key=f"uploader_{st.session_state['uploader_nonce']}",
 )
@@ -89,7 +88,7 @@ if not uploads:
 tmp_dir = tempfile.mkdtemp(prefix="romeo_sor_")
 
 
-SUPPORTED_EXTS = (".sor", ".json")
+SUPPORTED_EXTS = (".sor", ".json", ".trc")
 
 
 def _extract(uf, dest_dir):
@@ -125,21 +124,24 @@ for uf in uploads:
     saved_paths.extend(_extract(uf, tmp_dir))
 
 if not saved_paths:
-    st.error("No .sor or .json files found in the uploads.")
+    st.error("No .sor / .json / .trc files found in the uploads.")
     st.stop()
 
 # Partition by extension.
 sor_paths = [p for p in saved_paths if p.lower().endswith(".sor")]
 json_paths = [p for p in saved_paths if p.lower().endswith(".json")]
+trc_paths = [p for p in saved_paths if p.lower().endswith(".trc")]
 
 summary = f"Loaded {len(saved_paths)} file(s): {len(sor_paths)} SOR"
 if json_paths:
     summary += f", {len(json_paths)} JSON"
+if trc_paths:
+    summary += f", {len(trc_paths)} TRC"
 st.success(summary + ".")
 
-processed_paths = sor_paths + json_paths
+processed_paths = sor_paths + json_paths + trc_paths
 if not processed_paths:
-    st.error("No SOR or JSON files found; nothing to report.")
+    st.error("No SOR / JSON / TRC files found; nothing to report.")
     st.stop()
 
 saved_paths = processed_paths
@@ -170,76 +172,70 @@ def _filename_prefix_key(path, fiber_num=None):
     return stem[: chosen.start()].rstrip('-_ ') or 'Route'
 
 
-def group_by_firmware(paths):
-    """Read GenParams from each file and group by
-        (location_a, location_b, wavelength)
-    when both locations are populated. Otherwise fall back to the filename
-    prefix so files without OTDR location metadata still group by direction.
+def parse_and_group(paths):
+    """Single-pass parse + group. For each file, call load_fiber_records
+    (which emits one record per wavelength — TRC fans out to N records,
+    SOR/JSON emit a single record). Bucket each record into
+        groups[(loc_a, loc_b, wavelength)] = {fiber_num: fiber_record}
+    using GenParams locations when both are present, else the filename
+    prefix.
 
-    Fiber number: GenParams `fiber_id` digits first, else the first digit
-    run in the filename.
-
-    Returns (groups, skipped). `groups` maps (key_a, key_b, wavelength) to
-    {fiber_num: abs_path}. When the fallback is used, (key_a, key_b) is
-    (prefix, '<fromfilename>') so it's visually distinguishable in the UI.
+    Returns (groups, skipped).
     """
     groups = defaultdict(dict)
     skipped = []
     for p in paths:
         try:
-            gp = parse_gen_params_any(p)
-        except Exception:
-            gp = {}
-        loc_a = (gp.get('location_a') or '').strip()
-        loc_b = (gp.get('location_b') or '').strip()
-        fiber_id_raw = (gp.get('fiber_id') or '').strip()
-        wl = gp.get('wavelength_code', 0) or 0
-
-        digits_from_id = re.sub(r'\D', '', fiber_id_raw)
-        fnum = int(digits_from_id) if digits_from_id else None
-        if fnum is None:
-            m = re.search(r'\d+', os.path.basename(p))
-            fnum = int(m.group(0)) if m else None
-
-        if fnum is None:
-            skipped.append((p, gp))
+            records = load_fiber_records(p)
+        except Exception as e:
+            skipped.append((p, {'error': str(e)}))
             continue
+        if not records:
+            skipped.append((p, {'error': 'no records returned'}))
+            continue
+        for wl_nm, rec in records:
+            gp = rec.get('gen_params', {}) or {}
+            loc_a = (gp.get('location_a') or '').strip()
+            loc_b = (gp.get('location_b') or '').strip()
+            fiber_id_raw = (gp.get('fiber_id') or '').strip()
+            wl = wl_nm or gp.get('wavelength_code', 0) or 0
 
-        if loc_a and loc_b:
-            key = (loc_a, loc_b, wl)
-        else:
-            # Fall back to the filename prefix so TEST-style files still form
-            # one direction per prefix. Passing `fnum` lets the prefix
-            # extractor skip wavelength suffixes like "_1550".
-            prefix = _filename_prefix_key(p, fiber_num=fnum)
-            key = (prefix, '<fromfilename>', wl)
+            digits_from_id = re.sub(r'\D', '', fiber_id_raw)
+            fnum = int(digits_from_id) if digits_from_id else None
+            if fnum is None:
+                m = re.search(r'\d+', os.path.basename(p))
+                fnum = int(m.group(0)) if m else None
+            if fnum is None:
+                skipped.append((p, gp))
+                continue
 
-        groups[key][fnum] = p
+            if loc_a and loc_b:
+                key = (loc_a, loc_b, wl)
+            else:
+                prefix = _filename_prefix_key(p, fiber_num=fnum)
+                key = (prefix, '<fromfilename>', wl)
+
+            groups[key][fnum] = rec
     return groups, skipped
 
 
-with st.spinner(f"Reading firmware metadata from {len(saved_paths)} files…"):
-    fw_groups, skipped = group_by_firmware(saved_paths)
+with st.spinner(f"Parsing {len(saved_paths)} file(s)…"):
+    fw_groups, skipped = parse_and_group(saved_paths)
 
 fw_groups = {k: v for k, v in fw_groups.items() if len(v) >= 2}
 
 if not fw_groups:
     st.error(
-        "Could not find any direction with ≥2 fibers from firmware metadata "
-        "(GenParams location_a / location_b / fiber_id). "
-        f"{len(skipped)} file(s) lacked usable metadata."
+        "Could not find any direction with ≥2 fibers. "
+        f"{len(skipped)} file(s) had unusable metadata."
     )
-    with st.expander("Sample metadata (for debugging)", expanded=False):
-        for p in saved_paths[:25]:
-            try:
-                gp = parse_gen_params_any(p)
-            except Exception as e:
-                gp = {'error': str(e)}
-            st.text(f"{os.path.basename(p)}  →  {gp}")
+    with st.expander("Skip reasons (for debugging)", expanded=False):
+        for p, info in skipped[:25]:
+            st.text(f"{os.path.basename(p)}  →  {info}")
     st.stop()
 
 if skipped:
-    st.warning(f"Skipped {len(skipped)} file(s) missing firmware metadata.")
+    st.warning(f"Skipped {len(skipped)} file(s) (missing metadata or parse error).")
 
 
 # ----- parse each direction ---------------------------------------------
@@ -253,17 +249,14 @@ def pick_common(values):
 FALLBACK_SENTINEL = '<fromfilename>'
 
 
-def process_direction(loc_a, loc_b, wavelength, fiber_paths):
-    """fiber_paths: {fiber_num: absolute_path}. Parse every file and build
-    the direction record."""
-    fiber_nums = sorted(fiber_paths.keys())
-    fibers = {}
-    for n in fiber_nums:
-        fp = fiber_paths[n]
-        try:
-            fibers[f"{n:04d}"] = load_fiber_any(fp)
-        except Exception as e:
-            st.warning(f"Failed to parse {os.path.basename(fp)}: {e}")
+FALLBACK_SENTINEL = '<fromfilename>'
+
+
+def process_direction(loc_a, loc_b, wavelength, fiber_records):
+    """fiber_records: {fiber_num: parsed_fiber_dict}. Builds the direction
+    record from the already-parsed records (no I/O here)."""
+    fiber_nums = sorted(fiber_records.keys())
+    fibers = {f"{n:04d}": fiber_records[n] for n in fiber_nums}
     if len(fibers) < 2:
         return None
 
@@ -272,7 +265,6 @@ def process_direction(loc_a, loc_b, wavelength, fiber_paths):
     cable_code = pick_common([g.get('cable_code', '') for g in gp_list])
 
     if loc_b == FALLBACK_SENTINEL:
-        # loc_a is actually the filename prefix.
         label_base = loc_a or 'Unnamed'
         loc_a_display, loc_b_display = label_base, ''
     else:
@@ -293,22 +285,18 @@ def process_direction(loc_a, loc_b, wavelength, fiber_paths):
     }
 
 
-# If any JSON files are present, surface a debug view of their timestamp
+# If any JSON files were uploaded, surface a debug view of their timestamp
 # keys so we can confirm they're being parsed. Collapsed by default.
-json_in_groups = [path for grp in fw_groups.values() for path in grp.values()
-                  if path.lower().endswith('.json')]
-if json_in_groups:
+if json_paths:
+    first_json = json_paths[0]
     with st.expander(f"Debug: timestamp keys in first JSON file "
-                     f"({os.path.basename(json_in_groups[0])})", expanded=False):
-        for path, value in debug_timestamp_candidates(json_in_groups[0])[:40]:
+                     f"({os.path.basename(first_json)})", expanded=False):
+        for path, value in debug_timestamp_candidates(first_json)[:40]:
             st.text(f"  {path}  =  {value!r}")
 
 directions = []
-for (loc_a, loc_b, wl), fiber_paths in fw_groups.items():
-    label_disp = (loc_a if loc_b == FALLBACK_SENTINEL else f"{loc_a} → {loc_b}")
-    with st.spinner(f"Parsing {len(fiber_paths)} fibers for {label_disp}"
-                    + (f" @ {wl}nm" if wl else "") + "…"):
-        d = process_direction(loc_a, loc_b, wl, fiber_paths)
+for (loc_a, loc_b, wl), fiber_records in fw_groups.items():
+    d = process_direction(loc_a, loc_b, wl, fiber_records)
     if d is not None:
         directions.append(d)
 

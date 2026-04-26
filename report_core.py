@@ -255,18 +255,134 @@ def load_fiber_json(filepath):
     }
 
 
+def _trc_gen_params(filepath, wl_nm):
+    """Synthesize a GenParams-shape dict for TRC files (no embedded route
+    metadata). fiber_id is the FIRST digit run in the filename (so a
+    filename like `VERSLK001_131015501625.trc` yields fiber_id='001', not
+    the whole concatenated wavelength suffix)."""
+    import re as _re
+    base = os.path.basename(filepath)
+    stem = base.rpartition('.')[0] or base
+    m = _re.search(r'\d+', stem)
+    fiber_id = m.group(0) if m else ''
+    return {
+        'cable_id': '',
+        'fiber_id': fiber_id,
+        'fiber_type_code': 0,
+        'wavelength_code': wl_nm,
+        'location_a': '',
+        'location_b': '',
+        'cable_code': '',
+        'build_condition': '',
+        'operator': '',
+        'comment': '',
+    }
+
+
+def _safe_float(v, default=0.0):
+    """float() that turns None / NaN / non-numeric into `default`."""
+    try:
+        f = float(v) if v is not None else default
+    except (TypeError, ValueError):
+        return default
+    if f != f:  # NaN
+        return default
+    return f
+
+
+def _load_trc_records(filepath):
+    """Parse a multi-wavelength TRC file and return one fiber-record per
+    wavelength, in the same shape load_fiber() returns for SOR files."""
+    from trc_parser import parse_trc_file
+    out = parse_trc_file(filepath)
+    records = []
+    for wl in out.get('wavelengths', []):
+        wl_nm = wl.get('wavelength_nm') or 0
+        events = wl.get('events', []) or []
+        evt_list = []
+        total_splice = 0.0
+        first_pos = None
+        prev_pos = None
+        total_atten = 0.0
+        alpha_db_per_km = _safe_float(wl.get('alpha_db_per_km'), 0.0)
+        for i, ev in enumerate(events):
+            pos = ev.get('position_m')
+            if pos is None:
+                continue
+            if first_pos is None:
+                first_pos = pos
+            dist_km = (pos - first_pos) / 1000.0
+            loss = _safe_float(ev.get('loss_db'), 0.0)
+            total_splice += loss
+            if prev_pos is not None:
+                span_km = (pos - prev_pos) / 1000.0
+                total_atten += alpha_db_per_km * span_km
+            prev_pos = pos
+            evt_list.append({
+                'number': i,
+                'dist_km': dist_km,
+                'splice_loss': loss,
+                'splice_mdB': round(loss * 1000),
+                'reflection': _safe_float(ev.get('refl_db'), 0.0),
+            })
+        total_loss = total_splice + total_atten
+        rec = {
+            'events': evt_list,
+            'timestamp': out.get('timestamp') or 0,
+            'filesize': out.get('filesize', 0),
+            'filename': out.get('filename', os.path.basename(filepath)),
+            'total_splice_dB': total_splice,
+            'total_fiber_atten_dB': total_atten,
+            'total_loss_dB': total_loss,
+            'total_loss_mdB': round(total_loss * 1000),
+            'gen_params': _trc_gen_params(filepath, wl_nm),
+        }
+        records.append((wl_nm, rec))
+    return records
+
+
 def parse_gen_params_any(filepath):
-    """Dispatch to the right metadata extractor based on file extension."""
-    if filepath.lower().endswith('.json'):
+    """Dispatch to the right metadata extractor based on file extension.
+    For TRC the returned dict has no locations and a fiber_id derived from
+    the filename — the actual wavelength is unknown until the file is parsed
+    (use load_fiber_records for that)."""
+    lower = filepath.lower()
+    if lower.endswith('.json'):
         return parse_gen_params_json(filepath)
+    if lower.endswith('.trc'):
+        return _trc_gen_params(filepath, 0)
     return parse_gen_params(filepath)
 
 
 def load_fiber_any(filepath):
-    """Dispatch to the right loader based on file extension."""
-    if filepath.lower().endswith('.json'):
+    """Single-record dispatcher (for SOR/JSON only — for TRC use
+    load_fiber_records, which returns one record per wavelength)."""
+    lower = filepath.lower()
+    if lower.endswith('.json'):
         return load_fiber_json(filepath)
+    if lower.endswith('.trc'):
+        # Caller should use load_fiber_records for multi-wavelength TRC,
+        # but as a fallback we return the first wavelength's record.
+        records = _load_trc_records(filepath)
+        if not records:
+            raise ValueError(f"No wavelengths found in {filepath}")
+        return records[0][1]
     return load_fiber(filepath)
+
+
+def load_fiber_records(filepath):
+    """Return [(wavelength_nm, fiber_dict), ...]. Length 1 for SOR/JSON,
+    one entry per wavelength for TRC."""
+    lower = filepath.lower()
+    if lower.endswith('.trc'):
+        return _load_trc_records(filepath)
+    if lower.endswith('.json'):
+        rec = load_fiber_json(filepath)
+        wl = (rec.get('gen_params', {}) or {}).get('wavelength_code', 0) or 0
+        return [(wl, rec)]
+    rec = load_fiber(filepath)
+    wl = (rec.get('gen_params', {}) or {}).get('wavelength_code', 0) or 0
+    return [(wl, rec)]
 
 
 def load_fiber(filepath):
