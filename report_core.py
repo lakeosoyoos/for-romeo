@@ -290,14 +290,46 @@ def _safe_float(v, default=0.0):
     return f
 
 
+def _trc_acquisition_dates(filepath):
+    """Pull per-wavelength acquisition timestamps out of a TRC stream.
+    Returns a list of unix-timestamp ints (one per wavelength block found).
+    Empty list on failure."""
+    try:
+        from trc_parser import _decompress_trc
+        from exfo_proprietary_decoder import decode_all_fields
+        stream = _decompress_trc(filepath)
+        fields = decode_all_fields(stream)
+    except Exception:
+        return []
+    out = []
+    for f in fields:
+        if f['name'] != 'Date' or f['data_size'] < 4:
+            continue
+        val_off = f['offset'] + len(b'Date') + 1
+        raw = stream[val_off:val_off + f['data_size']]
+        # EXFO stores Date as UTF-16-LE ISO string (e.g. "2026-04-17T20:44:40").
+        try:
+            s = raw.decode('utf-16-le').rstrip('\x00').strip()
+        except UnicodeDecodeError:
+            continue
+        ts = _parse_iso_to_unix(s)
+        if ts:
+            out.append(ts)
+    return out
+
+
 def _load_trc_records(filepath):
     """Parse a multi-wavelength TRC file and return one fiber-record per
     wavelength, in the same shape load_fiber() returns for SOR files."""
     from trc_parser import parse_trc_file
     out = parse_trc_file(filepath)
+    acquisition_ts = _trc_acquisition_dates(filepath)
     records = []
-    for wl in out.get('wavelengths', []):
+    for wl_idx, wl in enumerate(out.get('wavelengths', [])):
         wl_nm = wl.get('wavelength_nm') or 0
+        # Per-wavelength acquisition timestamp; fall back to file mtime.
+        ts = acquisition_ts[wl_idx] if wl_idx < len(acquisition_ts) else (
+            out.get('timestamp') or 0)
         events = wl.get('events', []) or []
         evt_list = []
         total_splice = 0.0
@@ -328,7 +360,7 @@ def _load_trc_records(filepath):
         total_loss = total_splice + total_atten
         rec = {
             'events': evt_list,
-            'timestamp': out.get('timestamp') or 0,
+            'timestamp': ts,
             'filesize': out.get('filesize', 0),
             'filename': out.get('filename', os.path.basename(filepath)),
             'total_splice_dB': total_splice,
