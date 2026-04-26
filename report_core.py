@@ -495,7 +495,23 @@ def _histogram_b64(pairs, title_str):
     diffs = [p['max_diff_mdB'] for p in pairs]
     fig, ax = plt.subplots(figsize=(14, 4))
     max_x = max(diffs) + 10
-    bins = np.arange(0, max_x, 5)
+
+    # Pick a "nice" bin width that gives roughly 50 bars regardless of range.
+    # Target widths: 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000 mdB, etc.
+    target_bins = 50
+    raw_w = max(1.0, max_x / target_bins)
+    exp = 10 ** int(np.log10(raw_w))
+    mantissa = raw_w / exp
+    if mantissa < 1.5:
+        nice_w = 1 * exp
+    elif mantissa < 3.5:
+        nice_w = 2 * exp
+    elif mantissa < 7.5:
+        nice_w = 5 * exp
+    else:
+        nice_w = 10 * exp
+    bins = np.arange(0, max_x + nice_w, nice_w)
+
     ax.hist(diffs, bins=bins, color='#4A90D9', edgecolor='white', linewidth=0.5, alpha=0.85)
     ax.set_xlabel('Max splice diff (mdB)', fontsize=11)
     ax.set_ylabel('Number of pairs', fontsize=11)
