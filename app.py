@@ -249,9 +249,6 @@ def pick_common(values):
 FALLBACK_SENTINEL = '<fromfilename>'
 
 
-FALLBACK_SENTINEL = '<fromfilename>'
-
-
 def process_direction(loc_a, loc_b, wavelength, fiber_records):
     """fiber_records: {fiber_num: parsed_fiber_dict}. Builds the direction
     record from the already-parsed records (no I/O here)."""
