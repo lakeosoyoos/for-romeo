@@ -33,11 +33,41 @@ def _read_cstr(raw, offset):
     return s, end + 1
 
 
+def parse_sup_params(filepath):
+    """Read the SOR SupParams block (supplier + OTDR mainframe/module IDs)."""
+    with open(filepath, 'rb') as f:
+        raw = f.read()
+    marker = b'SupParams\x00'
+    # Skip the map/TOC entry by starting past byte 50.
+    i = raw.find(marker, 50)
+    if i < 0:
+        return {}
+    p = i + len(marker)
+    out = {}
+    for key in ('supplier_name', 'otdr_mainframe_id', 'otdr_mainframe_sn',
+                'otdr_module_id', 'otdr_module_sn', 'software_rev',
+                'otdr_other'):
+        s, p = _read_cstr(raw, p)
+        out[key] = s
+    return out
+
+
+def _otdr_serial_from_sup(sup):
+    """Pick the most useful OTDR serial from a SupParams dict.
+    Prefers mainframe SN, falls back to module SN."""
+    for key in ('otdr_mainframe_sn', 'otdr_module_sn'):
+        v = (sup.get(key) or '').strip()
+        if v:
+            return v
+    return ''
+
+
 def parse_gen_params(filepath):
     """Pull route-level metadata from the SOR GenParams block.
 
     Returns a dict with whatever could be read (empty strings otherwise):
-    cable_id, fiber_id, location_a, location_b, cable_code, operator, comment.
+    cable_id, fiber_id, location_a, location_b, cable_code, operator, comment,
+    plus serial_number (from the SupParams block).
     """
     with open(filepath, 'rb') as f:
         raw = f.read()
@@ -66,6 +96,9 @@ def parse_gen_params(filepath):
     for key in ('operator', 'comment'):
         s, p = _read_cstr(raw, p)
         out[key] = s
+    # Pull the OTDR serial from the SupParams block too — kept on the same
+    # gen_params dict so downstream code only has one place to look.
+    out['serial_number'] = _otdr_serial_from_sup(parse_sup_params(filepath))
     return out
 
 
@@ -108,6 +141,14 @@ def parse_gen_params_json(filepath):
     cable_code = _find_key(data, {'cablecode'})
     operator = _find_key(data, {'operator', 'user', 'technician'})
     comment = _find_key(data, {'comment', 'comments', 'notes'})
+    # OTDR device serial number — try strongest keys first so we don't pick
+    # up a power-meter or PCB sub-serial by accident.
+    serial = (
+        _find_key(data, {'mainframeserialnumber', 'otdrmainframeserialnumber'})
+        or _find_key(data, {'unitaserialnumber', 'unitserialnumber',
+                            'moduleserialnumber'})
+        or _find_key(data, {'serialnumber'})
+    )
 
     # Wavelength code (short int matching SOR convention) — pull from the
     # JSON, round to nearest nm.
@@ -128,6 +169,7 @@ def parse_gen_params_json(filepath):
         'build_condition': '',
         'operator': operator,
         'comment': comment,
+        'serial_number': serial,
     }
 
 
@@ -265,11 +307,36 @@ def load_fiber_json(filepath):
     }
 
 
-def _trc_gen_params(filepath, wl_nm):
+def _trc_serial_number(filepath):
+    """Extract the OTDR module SerialNumber from the proprietary TRC stream
+    (UTF-16-LE). Returns '' if not found or if the stream can't be parsed."""
+    try:
+        from trc_parser import _decompress_trc
+        from exfo_proprietary_decoder import decode_all_fields
+        stream = _decompress_trc(filepath)
+        fields = decode_all_fields(stream)
+    except Exception:
+        return ''
+    for f in fields:
+        if f['name'] != 'SerialNumber' or f['data_size'] <= 0:
+            continue
+        val_off = f['offset'] + len(b'SerialNumber') + 1
+        raw = stream[val_off:val_off + f['data_size']]
+        try:
+            s = raw.decode('utf-16-le').rstrip('\x00').strip()
+        except UnicodeDecodeError:
+            continue
+        if s:
+            return s
+    return ''
+
+
+def _trc_gen_params(filepath, wl_nm, serial=None):
     """Synthesize a GenParams-shape dict for TRC files (no embedded route
     metadata). fiber_id is the FIRST digit run in the filename (so a
     filename like `VERSLK001_131015501625.trc` yields fiber_id='001', not
-    the whole concatenated wavelength suffix)."""
+    the whole concatenated wavelength suffix). `serial` may be passed in by
+    the caller to avoid re-decoding the stream once per wavelength."""
     import re as _re
     base = os.path.basename(filepath)
     stem = base.rpartition('.')[0] or base
@@ -286,6 +353,7 @@ def _trc_gen_params(filepath, wl_nm):
         'build_condition': '',
         'operator': '',
         'comment': '',
+        'serial_number': serial if serial is not None else _trc_serial_number(filepath),
     }
 
 
@@ -334,6 +402,7 @@ def _load_trc_records(filepath):
     from trc_parser import parse_trc_file
     out = parse_trc_file(filepath)
     acquisition_ts = _trc_acquisition_dates(filepath)
+    serial = _trc_serial_number(filepath)
     records = []
     for wl_idx, wl in enumerate(out.get('wavelengths', [])):
         wl_nm = wl.get('wavelength_nm') or 0
@@ -377,7 +446,7 @@ def _load_trc_records(filepath):
             'total_fiber_atten_dB': total_atten,
             'total_loss_dB': total_loss,
             'total_loss_mdB': round(total_loss * 1000),
-            'gen_params': _trc_gen_params(filepath, wl_nm),
+            'gen_params': _trc_gen_params(filepath, wl_nm, serial=serial),
         }
         records.append((wl_nm, rec))
     return records
@@ -490,12 +559,17 @@ def compare_pairs(fibers):
         ts_a = fibers[a]['timestamp']; ts_b = fibers[b]['timestamp']
         time_gap = abs(ts_a - ts_b) if ts_a and ts_b else None
         loss_a = fibers[a]['total_loss_mdB']; loss_b = fibers[b]['total_loss_mdB']
+        gp_a = fibers[a].get('gen_params', {}) or {}
+        gp_b = fibers[b].get('gen_params', {}) or {}
+        sn_a = (gp_a.get('serial_number') or '').strip()
+        sn_b = (gp_b.get('serial_number') or '').strip()
         pairs.append({
             'fiber_a': a, 'fiber_b': b, 'max_diff_mdB': max_diff,
             'per_event': per_event, 'timestamp_a': ts_a, 'timestamp_b': ts_b,
             'time_gap_sec': time_gap,
             'total_loss_a': loss_a, 'total_loss_b': loss_b,
             'total_loss_diff': abs(loss_a - loss_b),
+            'sn_a': sn_a, 'sn_b': sn_b,
         })
     pairs.sort(key=lambda x: x['max_diff_mdB'])
     return pairs
@@ -594,12 +668,16 @@ def _rows(pairs, top_n, event_start, event_end, include_total, highlight=None):
             total_cells = (f'<td class="center">{loss_a}</td>'
                            f'<td class="center">{loss_b}</td>'
                            f'<td class="center" style="{total_style}">{loss_diff}</td>')
+        sn_a = (p.get('sn_a') or '').strip() or '---'
+        sn_b = (p.get('sn_b') or '').strip() or '---'
         out += (f'<tr>'
                 f'<td class="center">{rank}</td>'
                 f'<td class="pair-cell">{a} &#8596; {b}</td>'
                 f'<td class="center" style="{diff_style}">{diff:.0f}</td>'
                 f'<td class="center" style="font-size:8px">{ts_a_str}</td>'
                 f'<td class="center" style="font-size:8px">{ts_b_str}</td>'
+                f'<td class="center" style="font-size:8px">{sn_a}</td>'
+                f'<td class="center" style="font-size:8px">{sn_b}</td>'
                 f'<td class="center"{gap_attr}>{gap_str}</td>'
                 f'{evt_cells}'
                 f'{total_cells}'
@@ -643,8 +721,8 @@ def _chunked_tables(pairs, title, total_events, force_break_first=False, highlig
 <h2>{chunk_title}</h2>
 <table class="vote-table">
 <thead>
-<tr><th>#</th><th style="text-align:left">Pair</th><th>Max Diff (mdB)</th><th>Time A</th><th>Time B</th><th>Gap</th>{evt_h}</tr>
-<tr><th></th><th style="text-align:left;font-size:7px;color:#888">Fiber 1 &#8596; Fiber 2</th><th></th><th></th><th></th><th></th>{evt_s}</tr>
+<tr><th>#</th><th style="text-align:left">Pair</th><th>Max Diff (mdB)</th><th>Time A</th><th>Time B</th><th>SN A</th><th>SN B</th><th>Gap</th>{evt_h}</tr>
+<tr><th></th><th style="text-align:left;font-size:7px;color:#888">Fiber 1 &#8596; Fiber 2</th><th></th><th></th><th></th><th></th><th></th><th></th>{evt_s}</tr>
 </thead>
 <tbody>
 {rows_html}
