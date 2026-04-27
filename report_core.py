@@ -721,7 +721,7 @@ def _chunked_tables(pairs, title, total_events, force_break_first=False, highlig
 <h2>{chunk_title}</h2>
 <table class="vote-table">
 <thead>
-<tr><th>#</th><th style="text-align:left">Pair</th><th>Max Diff (mdB)</th><th>Time A</th><th>Time B</th><th>SN A</th><th>SN B</th><th>Gap</th>{evt_h}</tr>
+<tr><th>#</th><th style="text-align:left">Pair</th><th>Max Diff (mdB)</th><th>Time A</th><th>Time B</th><th>Serial Number A</th><th>Serial Number B</th><th>Gap</th>{evt_h}</tr>
 <tr><th></th><th style="text-align:left;font-size:7px;color:#888">Fiber 1 &#8596; Fiber 2</th><th></th><th></th><th></th><th></th><th></th><th></th>{evt_s}</tr>
 </thead>
 <tbody>
