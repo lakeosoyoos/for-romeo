@@ -74,9 +74,14 @@ uploads = st.file_uploader(
 
 # Clear button sits immediately under the uploader so it's obvious.
 if st.button("🗑  Clear uploaded files", type="secondary"):
-    for k in ("pdf_bytes", "pdf_html"):
+    # Drop the current uploader's stored file list explicitly, plus any
+    # cached PDF render, then bump the nonce so the widget re-instantiates
+    # empty on the next run.
+    current_key = f"uploader_{st.session_state.get('uploader_nonce', 0)}"
+    for k in (current_key, "pdf_bytes", "pdf_html"):
         st.session_state.pop(k, None)
-    st.session_state["uploader_nonce"] += 1
+    st.session_state["uploader_nonce"] = st.session_state.get(
+        "uploader_nonce", 0) + 1
     st.rerun()
 
 if not uploads:
@@ -137,7 +142,51 @@ if json_paths:
     summary += f", {len(json_paths)} JSON"
 if trc_paths:
     summary += f", {len(trc_paths)} TRC"
-st.success(summary + ".")
+
+# Live status box: same green styling as st.success but with a spinning
+# indicator and updatable text. Replaces the static success message.
+status_box = st.empty()
+
+_STATUS_CSS = """
+<style>
+@keyframes zerodb-spin { to { transform: rotate(360deg); } }
+.zerodb-spinner {
+    width: 14px; height: 14px;
+    border: 2px solid rgba(33,195,84,.30);
+    border-top-color: rgb(33,195,84);
+    border-radius: 50%;
+    animation: zerodb-spin 0.8s linear infinite;
+    display: inline-block;
+    flex-shrink: 0;
+    margin-right: 10px;
+}
+.zerodb-status {
+    background: rgba(33, 195, 84, 0.16);
+    color: rgb(33, 195, 84);
+    border: 1px solid rgba(33, 195, 84, 0.30);
+    border-radius: 0.5rem;
+    padding: 0.75rem 1rem;
+    margin-bottom: 1rem;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    line-height: 1.3;
+}
+</style>
+"""
+
+
+def set_status(msg, done=False):
+    spinner = '' if done else '<div class="zerodb-spinner"></div>'
+    icon = '✓ &nbsp;' if done else ''
+    status_box.markdown(
+        _STATUS_CSS
+        + f'<div class="zerodb-status">{spinner}<span>{icon}{msg}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
+set_status(f"{summary}. Parsing…")
 
 processed_paths = sor_paths + json_paths + trc_paths
 if not processed_paths:
@@ -172,7 +221,7 @@ def _filename_prefix_key(path, fiber_num=None):
     return stem[: chosen.start()].rstrip('-_ ') or 'Route'
 
 
-def parse_and_group(paths):
+def parse_and_group(paths, on_progress=None):
     """Single-pass parse + group. For each file, call load_fiber_records
     (which emits one record per wavelength — TRC fans out to N records,
     SOR/JSON emit a single record). Bucket each record into
@@ -180,11 +229,17 @@ def parse_and_group(paths):
     using GenParams locations when both are present, else the filename
     prefix.
 
+    `on_progress(i, total)` is called every ~25 files so the UI status box
+    can show live progress without thrashing Streamlit on every iteration.
+
     Returns (groups, skipped).
     """
     groups = defaultdict(dict)
     skipped = []
-    for p in paths:
+    total = len(paths)
+    for i, p in enumerate(paths, 1):
+        if on_progress and (i == 1 or i == total or i % 25 == 0):
+            on_progress(i, total)
         try:
             records = load_fiber_records(p)
         except Exception as e:
@@ -219,8 +274,11 @@ def parse_and_group(paths):
     return groups, skipped
 
 
-with st.spinner(f"Parsing {len(saved_paths)} file(s)…"):
-    fw_groups, skipped = parse_and_group(saved_paths)
+def _on_parse_progress(i, total):
+    set_status(f"{summary}. Parsing {i}/{total}…")
+
+
+fw_groups, skipped = parse_and_group(saved_paths, on_progress=_on_parse_progress)
 
 fw_groups = {k: v for k, v in fw_groups.items() if len(v) >= 2}
 
@@ -282,6 +340,8 @@ def process_direction(loc_a, loc_b, wavelength, fiber_records):
     }
 
 
+set_status(f"{summary}. Comparing pairs…")
+
 directions = []
 for (loc_a, loc_b, wl), fiber_records in fw_groups.items():
     d = process_direction(loc_a, loc_b, wl, fiber_records)
@@ -319,6 +379,7 @@ for col, d in zip(cols, directions):
 
 
 # ----- build combined report + PDF --------------------------------------
+set_status(f"{summary}. Building report…")
 html = build_combined_report(route_name, [{
     'label': d['label'],
     'pairs': d['pairs'],
@@ -326,13 +387,15 @@ html = build_combined_report(route_name, [{
 } for d in directions])
 
 if st.session_state.get("pdf_html") != html:
-    with st.spinner("Rendering combined PDF…"):
-        try:
-            st.session_state["pdf_bytes"] = html_to_pdf_bytes(html, base_url=tmp_dir)
-            st.session_state["pdf_html"] = html
-        except Exception as e:
-            st.error(f"PDF export failed: {e}")
-            st.stop()
+    set_status(f"{summary}. Rendering PDF…")
+    try:
+        st.session_state["pdf_bytes"] = html_to_pdf_bytes(html, base_url=tmp_dir)
+        st.session_state["pdf_html"] = html
+    except Exception as e:
+        st.error(f"PDF export failed: {e}")
+        st.stop()
+
+set_status(f"{summary}. Ready.", done=True)
 
 safe_route = re.sub(r"[^A-Za-z0-9]+", "_", route_name).strip("_") or "route"
 fname = f"{safe_route}_bidir_shortened.pdf"
