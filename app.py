@@ -197,6 +197,9 @@ saved_paths = processed_paths
 
 
 # ----- group files by firmware GenParams (fallback to filename) --------
+FALLBACK_SENTINEL = '<fromfilename>'
+
+
 def _filename_prefix_key(path, fiber_num=None):
     """Return the filename prefix preceding the fiber number. If `fiber_num`
     is given, we find the digit run that matches it (so a trailing wavelength
@@ -222,19 +225,24 @@ def _filename_prefix_key(path, fiber_num=None):
 
 
 def parse_and_group(paths, on_progress=None):
-    """Single-pass parse + group. For each file, call load_fiber_records
-    (which emits one record per wavelength — TRC fans out to N records,
-    SOR/JSON emit a single record). Bucket each record into
-        groups[(loc_a, loc_b, wavelength)] = {fiber_num: fiber_record}
-    using GenParams locations when both are present, else the filename
-    prefix.
+    """Two-pass parse + group.
 
-    `on_progress(i, total)` is called every ~25 files so the UI status box
+    Pass 1: parse every file (TRC fans out to one record per wavelength)
+    and bucket records by firmware key (loc_a, loc_b, wavelength), or by
+    filename prefix when the firmware locations are missing.
+
+    Pass 2: inspect each bucket. If a single firmware bucket holds traces
+    from MULTIPLE distinct filename prefixes, that's the firmware-quirk
+    case where both directions of a route report identical locations —
+    split the bucket per prefix so we don't silently overwrite fibers that
+    share a number across the two prefixes.
+
+    `on_progress(i, total)` is called every ~25 files so the status box
     can show live progress without thrashing Streamlit on every iteration.
 
     Returns (groups, skipped).
     """
-    groups = defaultdict(dict)
+    raw_groups = defaultdict(list)  # firmware-key -> [(fnum, rec, prefix)]
     skipped = []
     total = len(paths)
     for i, p in enumerate(paths, 1):
@@ -264,14 +272,28 @@ def parse_and_group(paths, on_progress=None):
                 skipped.append((p, gp))
                 continue
 
+            prefix = _filename_prefix_key(p, fiber_num=fnum)
             if loc_a and loc_b:
                 key = (loc_a, loc_b, wl)
             else:
-                prefix = _filename_prefix_key(p, fiber_num=fnum)
-                key = (prefix, '<fromfilename>', wl)
+                key = (prefix, FALLBACK_SENTINEL, wl)
+            raw_groups[key].append((fnum, rec, prefix))
 
-            groups[key][fnum] = rec
-    return groups, skipped
+    final = defaultdict(dict)
+    for key, items in raw_groups.items():
+        prefixes = {pre for _, _, pre in items}
+        # If there's only one filename prefix (or we already used the
+        # filename fallback) keep the bucket whole.
+        if len(prefixes) <= 1 or key[1] == FALLBACK_SENTINEL:
+            for fnum, rec, _ in items:
+                final[key][fnum] = rec
+        else:
+            # Multiple distinct filename prefixes share the same firmware
+            # locations — split per prefix so overlapping fiber numbers
+            # don't overwrite each other.
+            for fnum, rec, pre in items:
+                final[(key[0], key[1], key[2], pre)][fnum] = rec
+    return final, skipped
 
 
 def _on_parse_progress(i, total):
@@ -304,12 +326,12 @@ def pick_common(values):
     return Counter(vals).most_common(1)[0][0]
 
 
-FALLBACK_SENTINEL = '<fromfilename>'
-
-
-def process_direction(loc_a, loc_b, wavelength, fiber_records):
+def process_direction(loc_a, loc_b, wavelength, prefix, fiber_records):
     """fiber_records: {fiber_num: parsed_fiber_dict}. Builds the direction
-    record from the already-parsed records (no I/O here)."""
+    record from the already-parsed records (no I/O here). `prefix` is set
+    when the parse_and_group tiebreaker split a firmware bucket by
+    filename prefix; it gets appended to the label so split sections are
+    distinguishable in the report."""
     fiber_nums = sorted(fiber_records.keys())
     fibers = {f"{n:04d}": fiber_records[n] for n in fiber_nums}
     if len(fibers) < 2:
@@ -325,6 +347,8 @@ def process_direction(loc_a, loc_b, wavelength, fiber_records):
     else:
         label_base = f"{loc_a} → {loc_b}"
         loc_a_display, loc_b_display = loc_a, loc_b
+        if prefix:
+            label_base = f"{label_base} ({prefix})"
 
     label = f"{label_base} @ {wavelength}nm" if wavelength else label_base
     route_hint = cable_id or cable_code or loc_a_display or 'Route'
@@ -343,8 +367,15 @@ def process_direction(loc_a, loc_b, wavelength, fiber_records):
 set_status(f"{summary}. Comparing pairs…")
 
 directions = []
-for (loc_a, loc_b, wl), fiber_records in fw_groups.items():
-    d = process_direction(loc_a, loc_b, wl, fiber_records)
+for key, fiber_records in fw_groups.items():
+    # `key` is either (loc_a, loc_b, wl) or (loc_a, loc_b, wl, prefix) when
+    # parse_and_group split a firmware bucket by filename prefix.
+    if len(key) == 4:
+        loc_a, loc_b, wl, prefix = key
+    else:
+        loc_a, loc_b, wl = key
+        prefix = None
+    d = process_direction(loc_a, loc_b, wl, prefix, fiber_records)
     if d is not None:
         directions.append(d)
 
