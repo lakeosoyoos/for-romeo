@@ -21,8 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from report_core import (
-    load_fiber_records, compare_pairs, build_combined_report,
-    html_to_pdf_bytes, TOP_N,
+    load_fiber_records, compare_pairs, build_combined_csv, TOP_N,
 )
 
 
@@ -78,7 +77,8 @@ if st.button("🗑  Clear uploaded files", type="secondary"):
     # cached PDF render, then bump the nonce so the widget re-instantiates
     # empty on the next run.
     current_key = f"uploader_{st.session_state.get('uploader_nonce', 0)}"
-    for k in (current_key, "pdf_bytes", "pdf_html"):
+    for k in (current_key, "csv_bytes", "csv_signature",
+              "pdf_bytes", "pdf_html"):
         st.session_state.pop(k, None)
     st.session_state["uploader_nonce"] = st.session_state.get(
         "uploader_nonce", 0) + 1
@@ -409,27 +409,30 @@ for col, d in zip(cols, directions):
     col.metric("Median (mdB)", f"{median_val:.0f}")
 
 
-# ----- build combined report + PDF --------------------------------------
-set_status(f"{summary}. Building report…")
-html = build_combined_report(route_name, [{
+# ----- build combined CSV ----------------------------------------------
+set_status(f"{summary}. Building CSV…")
+csv_input = [{
     'label': d['label'],
     'pairs': d['pairs'],
     'fiber_nums': d['fiber_nums'],
-} for d in directions])
+} for d in directions]
 
-if st.session_state.get("pdf_html") != html:
-    set_status(f"{summary}. Rendering PDF…")
+# Cache: rebuild only when the underlying direction set changes.
+csv_signature = repr([(d['label'], len(d['pairs']),
+                       d['pairs'][0]['max_diff_mdB'] if d['pairs'] else 0)
+                      for d in directions])
+if st.session_state.get("csv_signature") != csv_signature:
     try:
-        st.session_state["pdf_bytes"] = html_to_pdf_bytes(html, base_url=tmp_dir)
-        st.session_state["pdf_html"] = html
+        st.session_state["csv_bytes"] = build_combined_csv(route_name, csv_input)
+        st.session_state["csv_signature"] = csv_signature
     except Exception as e:
-        st.error(f"PDF export failed: {e}")
+        st.error(f"CSV export failed: {e}")
         st.stop()
 
 set_status(f"{summary}. Ready.", done=True)
 
 safe_route = re.sub(r"[^A-Za-z0-9]+", "_", route_name).strip("_") or "route"
-fname = f"ForRomeo_{safe_route}_shortened.pdf"
+fname = f"ForRomeo_{safe_route}_shortened.csv"
 
 # Style the download button to look like Streamlit's green success alert:
 # darker green semi-transparent background, lime-green text, full-width bar.
@@ -464,8 +467,8 @@ st.markdown(
 )
 
 st.download_button(
-    "Download combined PDF",
-    data=st.session_state["pdf_bytes"],
+    "Download combined CSV",
+    data=st.session_state["csv_bytes"],
     file_name=fname,
-    mime="application/pdf",
+    mime="text/csv",
 )

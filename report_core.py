@@ -7,6 +7,8 @@ import os
 import sys
 import struct
 import base64
+import csv
+import io
 import numpy as np
 from itertools import combinations
 from datetime import datetime
@@ -961,6 +963,118 @@ def build_report(fibers, pairs, route_name, direction_label, fiber_nums):
         'pairs': pairs,
         'fiber_nums': fiber_nums,
     }])
+
+
+def build_combined_csv(route_name, directions):
+    """Build a single CSV (bytes) covering every direction × every ranking.
+
+    Columns mirror the PDF:
+        Direction, Ranking, Rank, Fiber A, Fiber B, Max Diff (mdB),
+        Time A, Time B, Serial Number A, Serial Number B, Gap, Gap (s),
+        Length Δ (m), then for each event Evt #N dist (km), Loss A (dB),
+        Loss B (dB), Δ (mdB), and finally Total Loss A (mdB),
+        Total Loss B (mdB), Total Loss Δ (mdB).
+
+    Three ranking blocks are emitted per direction (Smallest Splice Loss
+    Diff, Shortest Time Gap, Smallest Total Loss Diff), each capped at the
+    same TOP_N as the PDF, with the same red-highlight rule applied to
+    the corresponding column in the PDF noted in the Ranking column.
+    """
+    buf = io.StringIO()
+    w = csv.writer(buf)
+
+    # Determine the widest event count across all directions so the header
+    # has the right number of "Evt #N …" column groups.
+    max_events = 0
+    for d in directions:
+        for p in d['pairs']:
+            n = len(p.get('per_event') or [])
+            if n > max_events:
+                max_events = n
+
+    base_cols = [
+        'Direction', 'Ranking', 'Rank',
+        'Fiber A', 'Fiber B', 'Max Diff (mdB)',
+        'Time A', 'Time B',
+        'Serial Number A', 'Serial Number B',
+        'Gap', 'Gap (s)',
+        'Length Δ (m)',
+    ]
+    event_cols = []
+    for i in range(1, max_events + 1):
+        event_cols += [
+            f'Evt #{i} Dist (km)',
+            f'Evt #{i} Loss A (dB)',
+            f'Evt #{i} Loss B (dB)',
+            f'Evt #{i} Δ (mdB)',
+        ]
+    total_cols = ['Total Loss A (mdB)', 'Total Loss B (mdB)', 'Total Loss Δ (mdB)']
+    w.writerow(base_cols + event_cols + total_cols)
+
+    rankings = (
+        ('Smallest Splice Loss Difference', lambda x: x['max_diff_mdB']),
+        ('Shortest Time Gap',
+         lambda x: x['time_gap_sec'] if x.get('time_gap_sec') is not None else float('inf')),
+        ('Smallest Total Loss Difference', lambda x: x.get('total_loss_diff', 1e18)),
+    )
+
+    for d in directions:
+        for ranking_name, sort_key in rankings:
+            sorted_pairs = sorted(d['pairs'], key=sort_key)
+            for rank, p in enumerate(sorted_pairs[:TOP_N], 1):
+                ts_a = p.get('timestamp_a')
+                ts_b = p.get('timestamp_b')
+                t_a = (datetime.fromtimestamp(ts_a).strftime('%Y-%m-%d %H:%M:%S')
+                       if ts_a else '')
+                t_b = (datetime.fromtimestamp(ts_b).strftime('%Y-%m-%d %H:%M:%S')
+                       if ts_b else '')
+                gap = p.get('time_gap_sec')
+                if gap is None:
+                    gap_str, gap_sec = '', ''
+                elif gap < 120:
+                    gap_str, gap_sec = f'{gap:.0f}s', f'{gap}'
+                elif gap < 3600:
+                    gap_str, gap_sec = f'{gap/60:.0f}m', f'{gap}'
+                else:
+                    gap_str, gap_sec = f'{gap/3600:.1f}h', f'{gap}'
+                length_diff = p.get('length_diff_m')
+                length_diff_str = (f'{length_diff:.1f}'
+                                   if length_diff is not None else '')
+
+                row = [
+                    d['label'],
+                    ranking_name,
+                    rank,
+                    p['fiber_a'], p['fiber_b'],
+                    f"{p['max_diff_mdB']:.0f}",
+                    t_a, t_b,
+                    (p.get('sn_a') or ''),
+                    (p.get('sn_b') or ''),
+                    gap_str, gap_sec,
+                    length_diff_str,
+                ]
+
+                per_event = p.get('per_event') or []
+                for i in range(max_events):
+                    if i < len(per_event):
+                        ev = per_event[i]
+                        row += [
+                            f"{ev['dist_km']:.3f}",
+                            f"{ev['loss_a']:+.4f}",
+                            f"{ev['loss_b']:+.4f}",
+                            f"{ev['diff_mdB']:.0f}",
+                        ]
+                    else:
+                        row += ['', '', '', '']
+
+                row += [
+                    f"{p.get('total_loss_a', '')}",
+                    f"{p.get('total_loss_b', '')}",
+                    f"{p.get('total_loss_diff', '')}",
+                ]
+                w.writerow(row)
+
+    return buf.getvalue().encode('utf-8-sig')  # BOM helps Excel detect UTF-8.
 
 
 def html_to_pdf_bytes(html_str, base_url=None):
