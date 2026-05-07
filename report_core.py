@@ -609,6 +609,8 @@ def compare_pairs(fibers):
         len_a = float(fibers[a].get('length_m') or 0.0)
         len_b = float(fibers[b].get('length_m') or 0.0)
         len_diff = abs(len_a - len_b) if (len_a > 0 and len_b > 0) else None
+        fname_a = fibers[a].get('filename') or ''
+        fname_b = fibers[b].get('filename') or ''
         pairs.append({
             'fiber_a': a, 'fiber_b': b, 'max_diff_mdB': max_diff,
             'per_event': per_event, 'timestamp_a': ts_a, 'timestamp_b': ts_b,
@@ -618,6 +620,7 @@ def compare_pairs(fibers):
             'sn_a': sn_a, 'sn_b': sn_b,
             'length_a_m': len_a, 'length_b_m': len_b,
             'length_diff_m': len_diff,
+            'filename_a': fname_a, 'filename_b': fname_b,
         })
     pairs.sort(key=lambda x: x['max_diff_mdB'])
     return pairs
@@ -994,7 +997,9 @@ def build_combined_csv(route_name, directions):
 
     base_cols = [
         'Direction', 'Ranking', 'Rank',
-        'Fiber A', 'Fiber B', 'Max Diff (mdB)',
+        'Fiber A', 'Fiber B',
+        'Filename A', 'Filename B',
+        'Max Diff (mdB)',
         'Time A', 'Time B',
         'Serial Number A', 'Serial Number B',
         'Gap', 'Gap (s)',
@@ -1046,6 +1051,8 @@ def build_combined_csv(route_name, directions):
                     ranking_name,
                     rank,
                     p['fiber_a'], p['fiber_b'],
+                    (p.get('filename_a') or ''),
+                    (p.get('filename_b') or ''),
                     f"{p['max_diff_mdB']:.0f}",
                     t_a, t_b,
                     (p.get('sn_a') or ''),
