@@ -429,7 +429,7 @@ if st.session_state.get("pdf_html") != html:
 set_status(f"{summary}. Ready.", done=True)
 
 safe_route = re.sub(r"[^A-Za-z0-9]+", "_", route_name).strip("_") or "route"
-fname = f"{safe_route}_bidir_shortened.pdf"
+fname = f"ForRomeo_{safe_route}_shortened.pdf"
 
 # Style the download button to look like Streamlit's green success alert:
 # darker green semi-transparent background, lime-green text, full-width bar.
