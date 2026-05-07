@@ -299,6 +299,7 @@ def load_fiber_json(filepath):
 
     total_loss = total_splice + total_fiber_atten
     filesize = os.path.getsize(filepath)
+    length_m = float(parsed.get('_json_span_m') or 0.0)
     return {
         'events': evt_list,
         'timestamp': ts,
@@ -308,6 +309,7 @@ def load_fiber_json(filepath):
         'total_fiber_atten_dB': total_fiber_atten,
         'total_loss_dB': total_loss,
         'total_loss_mdB': round(total_loss * 1000),
+        'length_m': length_m,
         'gen_params': parse_gen_params_json(filepath),
     }
 
@@ -459,6 +461,7 @@ def _load_trc_records(filepath):
                 'reflection': _safe_float(ev.get('refl_db'), 0.0),
             })
         total_loss = total_splice + total_atten
+        length_m = _safe_float(wl.get('length_m'), 0.0)
         rec = {
             'events': evt_list,
             'timestamp': ts,
@@ -468,6 +471,7 @@ def _load_trc_records(filepath):
             'total_fiber_atten_dB': total_atten,
             'total_loss_dB': total_loss,
             'total_loss_mdB': round(total_loss * 1000),
+            'length_m': length_m,
             'gen_params': _trc_gen_params(filepath, wl_nm, serial=serial),
         }
         records.append((wl_nm, rec))
@@ -530,9 +534,13 @@ def load_fiber(filepath):
     evt_list = []
     total_splice = 0
     total_fiber_atten = 0
+    length_m = 0.0
     for i, evt in enumerate(events):
         dist_m = time_to_dist_m(evt['time_of_travel'], IOR)
         dist_km = (dist_m - first_dist) / 1000.0
+        # Track the farthest event distance so we can report fiber length.
+        if (dist_m - first_dist) > length_m:
+            length_m = dist_m - first_dist
         splice = evt['splice_loss_fw']
         # Total loss is computed over ALL events (launch + interior + end)
         # so the per-fiber Total Loss column is a true span-loss budget.
@@ -565,6 +573,7 @@ def load_fiber(filepath):
             'total_fiber_atten_dB': total_fiber_atten,
             'total_loss_dB': total_loss,
             'total_loss_mdB': round(total_loss * 1000),
+            'length_m': length_m,
             'gen_params': gp}
 
 
@@ -595,6 +604,9 @@ def compare_pairs(fibers):
         gp_b = fibers[b].get('gen_params', {}) or {}
         sn_a = (gp_a.get('serial_number') or '').strip()
         sn_b = (gp_b.get('serial_number') or '').strip()
+        len_a = float(fibers[a].get('length_m') or 0.0)
+        len_b = float(fibers[b].get('length_m') or 0.0)
+        len_diff = abs(len_a - len_b) if (len_a > 0 and len_b > 0) else None
         pairs.append({
             'fiber_a': a, 'fiber_b': b, 'max_diff_mdB': max_diff,
             'per_event': per_event, 'timestamp_a': ts_a, 'timestamp_b': ts_b,
@@ -602,6 +614,8 @@ def compare_pairs(fibers):
             'total_loss_a': loss_a, 'total_loss_b': loss_b,
             'total_loss_diff': abs(loss_a - loss_b),
             'sn_a': sn_a, 'sn_b': sn_b,
+            'length_a_m': len_a, 'length_b_m': len_b,
+            'length_diff_m': len_diff,
         })
     pairs.sort(key=lambda x: x['max_diff_mdB'])
     return pairs
@@ -702,6 +716,8 @@ def _rows(pairs, top_n, event_start, event_end, include_total, highlight=None):
                            f'<td class="center" style="{total_style}">{loss_diff}</td>')
         sn_a = (p.get('sn_a') or '').strip() or '---'
         sn_b = (p.get('sn_b') or '').strip() or '---'
+        len_diff_m = p.get('length_diff_m')
+        len_diff_str = f'{len_diff_m:.1f}' if len_diff_m is not None else '---'
         out += (f'<tr>'
                 f'<td class="center">{rank}</td>'
                 f'<td class="pair-cell">{a} &#8596; {b}</td>'
@@ -711,6 +727,7 @@ def _rows(pairs, top_n, event_start, event_end, include_total, highlight=None):
                 f'<td class="center" style="font-size:8px">{sn_a}</td>'
                 f'<td class="center" style="font-size:8px">{sn_b}</td>'
                 f'<td class="center"{gap_attr}>{gap_str}</td>'
+                f'<td class="center">{len_diff_str}</td>'
                 f'{evt_cells}'
                 f'{total_cells}'
                 f'</tr>\n')
@@ -753,8 +770,8 @@ def _chunked_tables(pairs, title, total_events, force_break_first=False, highlig
 <h2>{chunk_title}</h2>
 <table class="vote-table">
 <thead>
-<tr><th>#</th><th style="text-align:left">Pair</th><th>Max Diff (mdB)</th><th>Time A</th><th>Time B</th><th>Serial Number A</th><th>Serial Number B</th><th>Gap</th>{evt_h}</tr>
-<tr><th></th><th style="text-align:left;font-size:7px;color:#888">Fiber 1 &#8596; Fiber 2</th><th></th><th></th><th></th><th></th><th></th><th></th>{evt_s}</tr>
+<tr><th>#</th><th style="text-align:left">Pair</th><th>Max Diff (mdB)</th><th>Time A</th><th>Time B</th><th>Serial Number A</th><th>Serial Number B</th><th>Gap</th><th>Length &#916; (m)</th>{evt_h}</tr>
+<tr><th></th><th style="text-align:left;font-size:7px;color:#888">Fiber 1 &#8596; Fiber 2</th><th></th><th></th><th></th><th></th><th></th><th></th><th></th>{evt_s}</tr>
 </thead>
 <tbody>
 {rows_html}
