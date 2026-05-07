@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from report_core import (
-    load_fiber_records, compare_pairs, build_combined_csv, TOP_N,
+    load_fiber_records, compare_pairs, build_combined_xlsx, TOP_N,
 )
 
 
@@ -77,7 +77,8 @@ if st.button("🗑  Clear uploaded files", type="secondary"):
     # cached PDF render, then bump the nonce so the widget re-instantiates
     # empty on the next run.
     current_key = f"uploader_{st.session_state.get('uploader_nonce', 0)}"
-    for k in (current_key, "csv_bytes", "csv_signature",
+    for k in (current_key, "xlsx_bytes", "xlsx_signature",
+              "csv_bytes", "csv_signature",
               "pdf_bytes", "pdf_html"):
         st.session_state.pop(k, None)
     st.session_state["uploader_nonce"] = st.session_state.get(
@@ -409,30 +410,30 @@ for col, d in zip(cols, directions):
     col.metric("Median (mdB)", f"{median_val:.0f}")
 
 
-# ----- build combined CSV ----------------------------------------------
-set_status(f"{summary}. Building CSV…")
-csv_input = [{
+# ----- build combined XLSX ---------------------------------------------
+set_status(f"{summary}. Building Excel workbook…")
+xlsx_input = [{
     'label': d['label'],
     'pairs': d['pairs'],
     'fiber_nums': d['fiber_nums'],
 } for d in directions]
 
 # Cache: rebuild only when the underlying direction set changes.
-csv_signature = repr([(d['label'], len(d['pairs']),
-                       d['pairs'][0]['max_diff_mdB'] if d['pairs'] else 0)
-                      for d in directions])
-if st.session_state.get("csv_signature") != csv_signature:
+xlsx_signature = repr([(d['label'], len(d['pairs']),
+                        d['pairs'][0]['max_diff_mdB'] if d['pairs'] else 0)
+                       for d in directions])
+if st.session_state.get("xlsx_signature") != xlsx_signature:
     try:
-        st.session_state["csv_bytes"] = build_combined_csv(route_name, csv_input)
-        st.session_state["csv_signature"] = csv_signature
+        st.session_state["xlsx_bytes"] = build_combined_xlsx(route_name, xlsx_input)
+        st.session_state["xlsx_signature"] = xlsx_signature
     except Exception as e:
-        st.error(f"CSV export failed: {e}")
+        st.error(f"Excel export failed: {e}")
         st.stop()
 
 set_status(f"{summary}. Ready.", done=True)
 
 safe_route = re.sub(r"[^A-Za-z0-9]+", "_", route_name).strip("_") or "route"
-fname = f"ForRomeo_{safe_route}_shortened.csv"
+fname = f"ForRomeo_{safe_route}_shortened.xlsx"
 
 # Style the download button to look like Streamlit's green success alert:
 # darker green semi-transparent background, lime-green text, full-width bar.
@@ -467,8 +468,8 @@ st.markdown(
 )
 
 st.download_button(
-    "Download combined CSV",
-    data=st.session_state["csv_bytes"],
+    "Download combined Excel",
+    data=st.session_state["xlsx_bytes"],
     file_name=fname,
-    mime="text/csv",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )

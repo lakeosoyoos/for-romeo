@@ -1072,6 +1072,153 @@ def build_combined_csv(route_name, directions):
     return buf.getvalue().encode('utf-8-sig')  # BOM helps Excel detect UTF-8.
 
 
+def _csv_rows_for_directions(directions):
+    """Shared row builder used by both CSV and XLSX exports.
+    Returns (header_columns, list_of_rows). Rows are plain Python values
+    (numbers stay numeric where it makes sense for spreadsheet use)."""
+    max_events = 0
+    for d in directions:
+        for p in d['pairs']:
+            n = len(p.get('per_event') or [])
+            if n > max_events:
+                max_events = n
+
+    base_cols = [
+        'Direction',
+        'Fiber A', 'Fiber B',
+        'Filename A', 'Filename B',
+        'Max Diff (mdB)',
+        'Time A', 'Time B',
+        'Serial Number A', 'Serial Number B',
+        'Gap', 'Gap (s)',
+        'Length Δ (m)',
+    ]
+    event_cols = []
+    for i in range(1, max_events + 1):
+        event_cols += [
+            f'Evt #{i} Dist (km)',
+            f'Evt #{i} Loss A (dB)',
+            f'Evt #{i} Loss B (dB)',
+            f'Evt #{i} Δ (mdB)',
+        ]
+    total_cols = ['Total Loss A (mdB)', 'Total Loss B (mdB)', 'Total Loss Δ (mdB)']
+    header = base_cols + event_cols + total_cols
+
+    rows = []
+    for d in directions:
+        for p in d['pairs']:
+            ts_a = p.get('timestamp_a')
+            ts_b = p.get('timestamp_b')
+            t_a = (datetime.fromtimestamp(ts_a).strftime('%Y-%m-%d %H:%M:%S')
+                   if ts_a else '')
+            t_b = (datetime.fromtimestamp(ts_b).strftime('%Y-%m-%d %H:%M:%S')
+                   if ts_b else '')
+            gap = p.get('time_gap_sec')
+            if gap is None:
+                gap_str, gap_sec = '', ''
+            elif gap < 120:
+                gap_str, gap_sec = f'{gap:.0f}s', int(gap)
+            elif gap < 3600:
+                gap_str, gap_sec = f'{gap/60:.0f}m', int(gap)
+            else:
+                gap_str, gap_sec = f'{gap/3600:.1f}h', int(gap)
+            length_diff = p.get('length_diff_m')
+            length_diff_val = (round(length_diff, 1)
+                               if length_diff is not None else '')
+
+            row = [
+                d['label'],
+                p['fiber_a'], p['fiber_b'],
+                (p.get('filename_a') or ''),
+                (p.get('filename_b') or ''),
+                int(p['max_diff_mdB']),
+                t_a, t_b,
+                (p.get('sn_a') or ''),
+                (p.get('sn_b') or ''),
+                gap_str, gap_sec,
+                length_diff_val,
+            ]
+
+            per_event = p.get('per_event') or []
+            for i in range(max_events):
+                if i < len(per_event):
+                    ev = per_event[i]
+                    row += [
+                        round(ev['dist_km'], 3),
+                        round(ev['loss_a'], 4),
+                        round(ev['loss_b'], 4),
+                        int(ev['diff_mdB']),
+                    ]
+                else:
+                    row += ['', '', '', '']
+
+            row += [
+                p.get('total_loss_a', ''),
+                p.get('total_loss_b', ''),
+                p.get('total_loss_diff', ''),
+            ]
+            rows.append(row)
+
+    return header, rows
+
+
+def build_combined_xlsx(route_name, directions):
+    """Build the same one-row-per-pair table as build_combined_csv but as
+    a real .xlsx workbook. Header row is bold and frozen; column widths
+    are roughly auto-sized so Excel/Numbers shows the data legibly."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    header, rows = _csv_rows_for_directions(directions)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Pairs"
+
+    header_font = Font(bold=True, color='1F4E2C')
+    header_fill = PatternFill(start_color='E8F5EC', end_color='E8F5EC',
+                              fill_type='solid')
+    center = Alignment(horizontal='center', vertical='center')
+    left = Alignment(horizontal='left', vertical='center')
+
+    ws.append(header)
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
+
+    for r in rows:
+        ws.append(r)
+
+    # Approximate column widths from observed content.
+    widths = [max(len(str(h)), 10) for h in header]
+    for r in rows:
+        for i, v in enumerate(r):
+            n = len(str(v)) if v != '' else 0
+            if n > widths[i]:
+                widths[i] = n
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = min(w + 2, 40)
+
+    # Left-align the text columns; everything else stays default-center for
+    # readability of numeric columns.
+    text_cols = {
+        'Direction', 'Filename A', 'Filename B',
+        'Time A', 'Time B', 'Serial Number A', 'Serial Number B',
+    }
+    for col_idx, name in enumerate(header, start=1):
+        if name in text_cols:
+            for row_idx in range(2, ws.max_row + 1):
+                ws.cell(row=row_idx, column=col_idx).alignment = left
+
+    ws.freeze_panes = 'A2'  # keep header visible while scrolling
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
 def html_to_pdf_bytes(html_str, base_url=None):
     """Render an HTML string to a PDF byte blob using WeasyPrint.
 
