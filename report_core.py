@@ -278,12 +278,17 @@ def load_fiber_json(filepath):
     for i, ev in enumerate(events):
         dist_km = ev['dist_km'] - first_dist_km
         splice = float(ev.get('splice_loss') or 0.0)
+        # Totals are computed over ALL events for an accurate span-loss budget.
         total_splice += splice
         if prev_km is not None:
             span_km = ev['dist_km'] - prev_km
             slope_dBkm = float(ev.get('slope') or 0.0)  # already dB/km
             total_fiber_atten += slope_dBkm * span_km
         prev_km = ev['dist_km']
+        # Interior-splice filter: drop launch (dist ≈ 0) and end-of-fiber.
+        is_endpoint = bool(ev.get('is_end')) or dist_km <= 0.01
+        if is_endpoint:
+            continue
         evt_list.append({
             'number': ev.get('number', i),
             'dist_km': dist_km,
@@ -410,6 +415,12 @@ def _load_trc_records(filepath):
         ts = acquisition_ts[wl_idx] if wl_idx < len(acquisition_ts) else (
             out.get('timestamp') or 0)
         events = wl.get('events', []) or []
+        # Find first/last events with valid positions for the endpoint filter.
+        valid_idx = [i for i, ev in enumerate(events)
+                     if ev.get('position_m') is not None]
+        last_valid_idx = valid_idx[-1] if valid_idx else -1
+        first_valid_idx = valid_idx[0] if valid_idx else -1
+
         evt_list = []
         total_splice = 0.0
         first_pos = None
@@ -424,11 +435,22 @@ def _load_trc_records(filepath):
                 first_pos = pos
             dist_km = (pos - first_pos) / 1000.0
             loss = _safe_float(ev.get('loss_db'), 0.0)
+            # Totals are computed over ALL events for an accurate span loss.
             total_splice += loss
             if prev_pos is not None:
                 span_km = (pos - prev_pos) / 1000.0
                 total_atten += alpha_db_per_km * span_km
             prev_pos = pos
+            # TRC events have no `is_end` flag, so we approximate: drop the
+            # first valid event (launch connector) and the last valid event
+            # (end-of-fiber reflection), plus anything at dist ≈ 0.
+            is_endpoint = (
+                i == first_valid_idx
+                or i == last_valid_idx
+                or dist_km <= 0.01
+            )
+            if is_endpoint:
+                continue
             evt_list.append({
                 'number': i,
                 'dist_km': dist_km,
@@ -512,12 +534,22 @@ def load_fiber(filepath):
         dist_m = time_to_dist_m(evt['time_of_travel'], IOR)
         dist_km = (dist_m - first_dist) / 1000.0
         splice = evt['splice_loss_fw']
+        # Total loss is computed over ALL events (launch + interior + end)
+        # so the per-fiber Total Loss column is a true span-loss budget.
         total_splice += splice
         if i > 0:
             prev_dist = time_to_dist_m(events[i-1]['time_of_travel'], IOR)
             span_km = (dist_m - prev_dist) / 1000.0
             slope_dBkm = evt['slope_raw'] / 1000.0
             total_fiber_atten += slope_dBkm * span_km
+        # Per-event detail and Max-Diff comparison use INTERIOR splices only,
+        # i.e. excluding the launch event (dist ≈ 0) and end-of-fiber
+        # reflections — same filter secret sauce uses. Endpoint events are
+        # connector/reflection artifacts, not splices, and would otherwise
+        # dominate the Max-Diff metric.
+        is_endpoint = bool(evt.get('is_end')) or dist_km <= 0.01
+        if is_endpoint:
+            continue
         evt_list.append({
             'number': evt['number'],
             'dist_km': dist_km,
