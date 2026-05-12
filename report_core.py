@@ -35,6 +35,77 @@ def _read_cstr(raw, offset):
     return s, end + 1
 
 
+def parse_fxd_params(filepath):
+    """Extract OTDR test-parameter / test-setting fields from FxdParams.
+
+    Returns a dict with whichever fields could be read; values are in their
+    natural display units (ns, dB, m, etc.). Empty dict on parse failure.
+
+    Field offsets (relative to start of FxdParams body, after the
+    `FxdParams\\x00` marker):
+        0      uint32  date_time
+        4      char[2] units (b'mt'/'km'/etc.)
+        6      uint16  wavelength × 0.1 nm
+        16     uint16  num_pulse_widths (N)
+        18     N×uint16  pulse widths in ns
+        18+N*2 uint32  acq_range
+        +4     uint32  n_samples
+        +8     uint32  IOR × 1e-5
+        +12    uint16  backscatter × 0.1 dB (positive value, implied −)
+        +14    uint32  num_averages
+        +38    uint16  splice threshold × 0.001 dB
+        +40    uint16  reflectance threshold × 0.001 dB
+        +42    uint16  end-of-fiber threshold × 0.001 dB
+    Offsets verified empirically against EXFO FTBx SOR exports.
+    """
+    try:
+        from lsa_event_calculator import _parse_blocks
+        with open(filepath, 'rb') as f:
+            data = f.read()
+        blocks = _parse_blocks(data)
+        if 'FxdParams' not in blocks:
+            return {}
+        body = blocks['FxdParams']['body']
+        size = blocks['FxdParams']['size']
+        if size < 64:
+            return {}
+        wavelength_nm = struct.unpack_from('<H', data, body + 6)[0] / 10.0
+        num_pw = struct.unpack_from('<H', data, body + 16)[0]
+        pulse_widths_ns = [
+            struct.unpack_from('<H', data, body + 18 + i * 2)[0]
+            for i in range(num_pw)
+        ]
+        pw_end = body + 18 + num_pw * 2
+        out = {'wavelength_nm': wavelength_nm,
+               'pulse_widths_ns': pulse_widths_ns,
+               'pulse_width_ns': pulse_widths_ns[0] if pulse_widths_ns else None}
+        # acq_range and IOR
+        if pw_end + 12 <= body + size:
+            out['acq_range_raw'] = struct.unpack_from('<I', data, pw_end)[0]
+            out['n_samples'] = struct.unpack_from('<I', data, pw_end + 4)[0]
+            ior_raw = struct.unpack_from('<I', data, pw_end + 8)[0]
+            out['ior'] = ior_raw / 1e5 if 100000 < ior_raw < 200000 else None
+        # backscatter (positive value, implied negative)
+        if pw_end + 14 <= body + size:
+            bs = struct.unpack_from('<H', data, pw_end + 12)[0]
+            out['backscatter_dB'] = -bs / 10.0
+        # n_averages
+        if pw_end + 18 <= body + size:
+            out['n_averages'] = struct.unpack_from('<I', data, pw_end + 14)[0]
+        # thresholds (offsets +38 / +40 / +42 from pw_end)
+        if pw_end + 44 <= body + size:
+            sp = struct.unpack_from('<H', data, pw_end + 38)[0]
+            rf = struct.unpack_from('<H', data, pw_end + 40)[0]
+            ef = struct.unpack_from('<H', data, pw_end + 42)[0]
+            # 0xFFFF is a "not set" sentinel some firmwares emit.
+            out['splice_threshold_dB'] = sp / 1000.0 if sp != 0xFFFF else None
+            out['refl_threshold_dB']   = -rf / 1000.0 if rf != 0xFFFF else None
+            out['eof_threshold_dB']    = ef / 1000.0 if ef != 0xFFFF else None
+        return out
+    except Exception:
+        return {}
+
+
 def parse_sup_params(filepath):
     """Read the SOR SupParams block (supplier + OTDR mainframe/module IDs)."""
     with open(filepath, 'rb') as f:
@@ -569,6 +640,17 @@ def load_fiber(filepath):
         })
     total_loss = total_splice + total_fiber_atten
     gp = parse_gen_params(filepath)
+    fxd = parse_fxd_params(filepath)
+    # Resolution (sample spacing) — already given by the trace parser.
+    resolution_m = parsed.get('dx_m')
+    # Interior splice stats (drop launch + end-of-fiber, same as event list).
+    interior_losses = [abs(ev['splice_loss']) for ev in evt_list]
+    avg_splice_dB = (sum(interior_losses) / len(interior_losses)
+                     if interior_losses else None)
+    max_splice_dB = max(interior_losses) if interior_losses else None
+    length_km = length_m / 1000.0 if length_m else None
+    avg_loss_per_km = (total_loss / length_km
+                       if length_km and length_km > 0 else None)
     return {'events': evt_list, 'timestamp': ts, 'filesize': len(raw),
             'filename': os.path.basename(filepath),
             'total_splice_dB': total_splice,
@@ -576,6 +658,11 @@ def load_fiber(filepath):
             'total_loss_dB': total_loss,
             'total_loss_mdB': round(total_loss * 1000),
             'length_m': length_m,
+            'resolution_m': resolution_m,
+            'avg_splice_dB': avg_splice_dB,
+            'max_splice_dB': max_splice_dB,
+            'avg_loss_dB_per_km': avg_loss_per_km,
+            'fxd_params': fxd,
             'gen_params': gp}
 
 
@@ -611,6 +698,8 @@ def compare_pairs(fibers):
         len_diff = abs(len_a - len_b) if (len_a > 0 and len_b > 0) else None
         fname_a = fibers[a].get('filename') or ''
         fname_b = fibers[b].get('filename') or ''
+        fx_a = fibers[a].get('fxd_params', {}) or {}
+        fx_b = fibers[b].get('fxd_params', {}) or {}
         pairs.append({
             'fiber_a': a, 'fiber_b': b, 'max_diff_mdB': max_diff,
             'per_event': per_event, 'timestamp_a': ts_a, 'timestamp_b': ts_b,
@@ -621,6 +710,34 @@ def compare_pairs(fibers):
             'length_a_m': len_a, 'length_b_m': len_b,
             'length_diff_m': len_diff,
             'filename_a': fname_a, 'filename_b': fname_b,
+            # OTDR test parameters / settings (per fiber)
+            'wavelength_a_nm': fx_a.get('wavelength_nm'),
+            'wavelength_b_nm': fx_b.get('wavelength_nm'),
+            'pulse_a_ns': fx_a.get('pulse_width_ns'),
+            'pulse_b_ns': fx_b.get('pulse_width_ns'),
+            'resolution_a_m': fibers[a].get('resolution_m'),
+            'resolution_b_m': fibers[b].get('resolution_m'),
+            'ior_a': fx_a.get('ior'),
+            'ior_b': fx_b.get('ior'),
+            'backscatter_a_dB': fx_a.get('backscatter_dB'),
+            'backscatter_b_dB': fx_b.get('backscatter_dB'),
+            'splice_thr_a_dB': fx_a.get('splice_threshold_dB'),
+            'splice_thr_b_dB': fx_b.get('splice_threshold_dB'),
+            'refl_thr_a_dB':   fx_a.get('refl_threshold_dB'),
+            'refl_thr_b_dB':   fx_b.get('refl_threshold_dB'),
+            'eof_thr_a_dB':    fx_a.get('eof_threshold_dB'),
+            'eof_thr_b_dB':    fx_b.get('eof_threshold_dB'),
+            'n_avg_a': fx_a.get('n_averages'),
+            'n_avg_b': fx_b.get('n_averages'),
+            # Computed results
+            'span_loss_a_dB': fibers[a].get('total_loss_dB'),
+            'span_loss_b_dB': fibers[b].get('total_loss_dB'),
+            'avg_loss_a_dB_km': fibers[a].get('avg_loss_dB_per_km'),
+            'avg_loss_b_dB_km': fibers[b].get('avg_loss_dB_per_km'),
+            'avg_splice_a_dB': fibers[a].get('avg_splice_dB'),
+            'avg_splice_b_dB': fibers[b].get('avg_splice_dB'),
+            'max_splice_a_dB': fibers[a].get('max_splice_dB'),
+            'max_splice_b_dB': fibers[b].get('max_splice_dB'),
         })
     pairs.sort(key=lambda x: x['max_diff_mdB'])
     return pairs
@@ -1093,6 +1210,22 @@ def _csv_rows_for_directions(directions):
         'Gap', 'Gap (s)',
         'Length Δ (m)',
     ]
+    # OTDR test parameters + results, per fiber (A then B for each metric).
+    otdr_cols = [
+        'Wavelength A (nm)', 'Wavelength B (nm)',
+        'Pulse A (ns)',      'Pulse B (ns)',
+        'Resolution A (m)',  'Resolution B (m)',
+        'IOR A',             'IOR B',
+        'Backscatter A (dB)','Backscatter B (dB)',
+        'Splice Thr A (dB)', 'Splice Thr B (dB)',
+        'Refl Thr A (dB)',   'Refl Thr B (dB)',
+        'EOF Thr A (dB)',    'EOF Thr B (dB)',
+        'N Averages A',      'N Averages B',
+        'Span Loss A (dB)',  'Span Loss B (dB)',
+        'Avg Loss A (dB/km)','Avg Loss B (dB/km)',
+        'Avg Splice A (dB)', 'Avg Splice B (dB)',
+        'Max Splice A (dB)', 'Max Splice B (dB)',
+    ]
     event_cols = []
     for i in range(1, max_events + 1):
         event_cols += [
@@ -1102,7 +1235,7 @@ def _csv_rows_for_directions(directions):
             f'Evt #{i} Δ (mdB)',
         ]
     total_cols = ['Total Loss A (mdB)', 'Total Loss B (mdB)', 'Total Loss Δ (mdB)']
-    header = base_cols + event_cols + total_cols
+    header = base_cols + otdr_cols + event_cols + total_cols
 
     rows = []
     for d in directions:
@@ -1126,6 +1259,12 @@ def _csv_rows_for_directions(directions):
             length_diff_val = (round(length_diff, 1)
                                if length_diff is not None else '')
 
+            def _r(v, nd=None):
+                """Render numeric fields tidily; blank for missing."""
+                if v is None or v == '':
+                    return ''
+                return round(v, nd) if nd is not None else v
+
             row = [
                 d['label'],
                 p['fiber_a'], p['fiber_b'],
@@ -1137,6 +1276,20 @@ def _csv_rows_for_directions(directions):
                 (p.get('sn_b') or ''),
                 gap_str, gap_sec,
                 length_diff_val,
+                # OTDR test parameters / results
+                _r(p.get('wavelength_a_nm'), 1), _r(p.get('wavelength_b_nm'), 1),
+                _r(p.get('pulse_a_ns')),        _r(p.get('pulse_b_ns')),
+                _r(p.get('resolution_a_m'), 3), _r(p.get('resolution_b_m'), 3),
+                _r(p.get('ior_a'), 5),          _r(p.get('ior_b'), 5),
+                _r(p.get('backscatter_a_dB'), 1), _r(p.get('backscatter_b_dB'), 1),
+                _r(p.get('splice_thr_a_dB'), 3), _r(p.get('splice_thr_b_dB'), 3),
+                _r(p.get('refl_thr_a_dB'), 1),   _r(p.get('refl_thr_b_dB'), 1),
+                _r(p.get('eof_thr_a_dB'), 3),    _r(p.get('eof_thr_b_dB'), 3),
+                _r(p.get('n_avg_a')),            _r(p.get('n_avg_b')),
+                _r(p.get('span_loss_a_dB'), 3),  _r(p.get('span_loss_b_dB'), 3),
+                _r(p.get('avg_loss_a_dB_km'), 4),_r(p.get('avg_loss_b_dB_km'), 4),
+                _r(p.get('avg_splice_a_dB'), 4), _r(p.get('avg_splice_b_dB'), 4),
+                _r(p.get('max_splice_a_dB'), 4), _r(p.get('max_splice_b_dB'), 4),
             ]
 
             per_event = p.get('per_event') or []
