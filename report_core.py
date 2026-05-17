@@ -35,6 +35,31 @@ def _read_cstr(raw, offset):
     return s, end + 1
 
 
+def parse_exfo_results(filepath):
+    """Pull span-level results (SpansLength, SpansLoss, TotalOrl) from the
+    EXFO proprietary block of a SOR file. Returns whichever values were
+    found; missing keys are omitted."""
+    out = {}
+    try:
+        from exfo_proprietary_decoder import (
+            parse_block_directory, decompress_proprietary, decode_all_fields,
+        )
+        with open(filepath, 'rb') as f:
+            data = f.read()
+        blocks = parse_block_directory(data)
+        stream = decompress_proprietary(data, blocks)
+        fields = decode_all_fields(stream)
+    except Exception:
+        return out
+    wanted = {'SpansLength', 'SpansLoss', 'TotalOrl'}
+    for f in fields:
+        n = f.get('name')
+        v = f.get('value')
+        if n in wanted and isinstance(v, (int, float)):
+            out.setdefault(n, v)
+    return out
+
+
 def parse_fxd_params(filepath):
     """Extract OTDR test-parameter / test-setting fields from FxdParams.
 
@@ -373,6 +398,22 @@ def load_fiber_json(filepath):
     total_loss = total_splice + total_fiber_atten
     filesize = os.path.getsize(filepath)
     length_m = float(parsed.get('_json_span_m') or 0.0)
+    interior_losses = [abs(ev['splice_loss']) for ev in evt_list]
+    avg_splice_dB = (sum(interior_losses) / len(interior_losses)
+                     if interior_losses else None)
+    max_splice_dB = max(interior_losses) if interior_losses else None
+    span_loss_dB = float(parsed.get('_json_total_loss_db') or 0.0) or total_loss
+    span_orl_dB = _find_key(raw_json, {'totalorl', 'orl', 'returnloss',
+                                       'spanorl'})
+    try:
+        span_orl_dB = float(span_orl_dB) if span_orl_dB else None
+    except ValueError:
+        span_orl_dB = None
+    span_length_km = length_m / 1000.0 if length_m else None
+    avg_loss_per_km = (span_loss_dB / span_length_km
+                       if (span_loss_dB is not None
+                           and span_length_km and span_length_km > 0)
+                       else None)
     return {
         'events': evt_list,
         'timestamp': ts,
@@ -383,6 +424,11 @@ def load_fiber_json(filepath):
         'total_loss_dB': total_loss,
         'total_loss_mdB': round(total_loss * 1000),
         'length_m': length_m,
+        'span_loss_dB': span_loss_dB,
+        'span_orl_dB': span_orl_dB,
+        'avg_splice_dB': avg_splice_dB,
+        'max_splice_dB': max_splice_dB,
+        'avg_loss_dB_per_km': avg_loss_per_km,
         'gen_params': parse_gen_params_json(filepath),
     }
 
@@ -476,6 +522,22 @@ def _trc_acquisition_dates(filepath):
     return out
 
 
+def _trc_total_orls(filepath):
+    """Return list of TotalOrl values per wavelength from the proprietary
+    stream (parallel to the wavelength order parse_trc_file emits)."""
+    try:
+        from trc_parser import _decompress_trc
+        from exfo_proprietary_decoder import decode_all_fields
+        stream = _decompress_trc(filepath)
+        fields = decode_all_fields(stream)
+    except Exception:
+        return []
+    return [f['value'] for f in sorted(
+        (f for f in fields if f['name'] == 'TotalOrl'
+         and isinstance(f.get('value'), (int, float))),
+        key=lambda f: f['offset'])]
+
+
 def _load_trc_records(filepath):
     """Parse a multi-wavelength TRC file and return one fiber-record per
     wavelength, in the same shape load_fiber() returns for SOR files."""
@@ -483,6 +545,7 @@ def _load_trc_records(filepath):
     out = parse_trc_file(filepath)
     acquisition_ts = _trc_acquisition_dates(filepath)
     serial = _trc_serial_number(filepath)
+    orls = _trc_total_orls(filepath)
     records = []
     for wl_idx, wl in enumerate(out.get('wavelengths', [])):
         wl_nm = wl.get('wavelength_nm') or 0
@@ -535,6 +598,17 @@ def _load_trc_records(filepath):
             })
         total_loss = total_splice + total_atten
         length_m = _safe_float(wl.get('length_m'), 0.0)
+        span_loss_dB = _safe_float(wl.get('span_loss_db'), total_loss)
+        span_orl_dB = orls[wl_idx] if wl_idx < len(orls) else None
+        length_km = length_m / 1000.0 if length_m else None
+        avg_loss_per_km = (span_loss_dB / length_km
+                           if (length_km and length_km > 0
+                               and span_loss_dB is not None)
+                           else None)
+        interior_losses = [abs(ev['splice_loss']) for ev in evt_list]
+        avg_splice_dB = (sum(interior_losses) / len(interior_losses)
+                         if interior_losses else None)
+        max_splice_dB = max(interior_losses) if interior_losses else None
         rec = {
             'events': evt_list,
             'timestamp': ts,
@@ -545,6 +619,11 @@ def _load_trc_records(filepath):
             'total_loss_dB': total_loss,
             'total_loss_mdB': round(total_loss * 1000),
             'length_m': length_m,
+            'span_loss_dB': span_loss_dB,
+            'span_orl_dB': span_orl_dB,
+            'avg_splice_dB': avg_splice_dB,
+            'max_splice_dB': max_splice_dB,
+            'avg_loss_dB_per_km': avg_loss_per_km,
             'gen_params': _trc_gen_params(filepath, wl_nm, serial=serial),
         }
         records.append((wl_nm, rec))
@@ -641,24 +720,35 @@ def load_fiber(filepath):
     total_loss = total_splice + total_fiber_atten
     gp = parse_gen_params(filepath)
     fxd = parse_fxd_params(filepath)
-    # Resolution (sample spacing) — already given by the trace parser.
-    resolution_m = parsed.get('dx_m')
+    exfo = parse_exfo_results(filepath)
+
     # Interior splice stats (drop launch + end-of-fiber, same as event list).
     interior_losses = [abs(ev['splice_loss']) for ev in evt_list]
     avg_splice_dB = (sum(interior_losses) / len(interior_losses)
                      if interior_losses else None)
     max_splice_dB = max(interior_losses) if interior_losses else None
-    length_km = length_m / 1000.0 if length_m else None
-    avg_loss_per_km = (total_loss / length_km
-                       if length_km and length_km > 0 else None)
+
+    # Prefer EXFO firmware-authoritative values; fall back to computed.
+    span_length_m = exfo.get('SpansLength') or length_m or None
+    span_loss_dB  = exfo.get('SpansLoss')
+    if span_loss_dB is None:
+        span_loss_dB = total_loss
+    span_orl_dB   = exfo.get('TotalOrl')
+
+    span_length_km = span_length_m / 1000.0 if span_length_m else None
+    avg_loss_per_km = (span_loss_dB / span_length_km
+                       if (span_loss_dB is not None
+                           and span_length_km and span_length_km > 0)
+                       else None)
     return {'events': evt_list, 'timestamp': ts, 'filesize': len(raw),
             'filename': os.path.basename(filepath),
             'total_splice_dB': total_splice,
             'total_fiber_atten_dB': total_fiber_atten,
             'total_loss_dB': total_loss,
             'total_loss_mdB': round(total_loss * 1000),
-            'length_m': length_m,
-            'resolution_m': resolution_m,
+            'length_m': span_length_m,
+            'span_loss_dB': span_loss_dB,
+            'span_orl_dB': span_orl_dB,
             'avg_splice_dB': avg_splice_dB,
             'max_splice_dB': max_splice_dB,
             'avg_loss_dB_per_km': avg_loss_per_km,
@@ -698,8 +788,6 @@ def compare_pairs(fibers):
         len_diff = abs(len_a - len_b) if (len_a > 0 and len_b > 0) else None
         fname_a = fibers[a].get('filename') or ''
         fname_b = fibers[b].get('filename') or ''
-        fx_a = fibers[a].get('fxd_params', {}) or {}
-        fx_b = fibers[b].get('fxd_params', {}) or {}
         pairs.append({
             'fiber_a': a, 'fiber_b': b, 'max_diff_mdB': max_diff,
             'per_event': per_event, 'timestamp_a': ts_a, 'timestamp_b': ts_b,
@@ -710,34 +798,19 @@ def compare_pairs(fibers):
             'length_a_m': len_a, 'length_b_m': len_b,
             'length_diff_m': len_diff,
             'filename_a': fname_a, 'filename_b': fname_b,
-            # OTDR test parameters / settings (per fiber)
-            'wavelength_a_nm': fx_a.get('wavelength_nm'),
-            'wavelength_b_nm': fx_b.get('wavelength_nm'),
-            'pulse_a_ns': fx_a.get('pulse_width_ns'),
-            'pulse_b_ns': fx_b.get('pulse_width_ns'),
-            'resolution_a_m': fibers[a].get('resolution_m'),
-            'resolution_b_m': fibers[b].get('resolution_m'),
-            'ior_a': fx_a.get('ior'),
-            'ior_b': fx_b.get('ior'),
-            'backscatter_a_dB': fx_a.get('backscatter_dB'),
-            'backscatter_b_dB': fx_b.get('backscatter_dB'),
-            'splice_thr_a_dB': fx_a.get('splice_threshold_dB'),
-            'splice_thr_b_dB': fx_b.get('splice_threshold_dB'),
-            'refl_thr_a_dB':   fx_a.get('refl_threshold_dB'),
-            'refl_thr_b_dB':   fx_b.get('refl_threshold_dB'),
-            'eof_thr_a_dB':    fx_a.get('eof_threshold_dB'),
-            'eof_thr_b_dB':    fx_b.get('eof_threshold_dB'),
-            'n_avg_a': fx_a.get('n_averages'),
-            'n_avg_b': fx_b.get('n_averages'),
-            # Computed results
-            'span_loss_a_dB': fibers[a].get('total_loss_dB'),
-            'span_loss_b_dB': fibers[b].get('total_loss_dB'),
+            # OTDR Results panel (per fiber)
+            'span_length_a_m': fibers[a].get('length_m'),
+            'span_length_b_m': fibers[b].get('length_m'),
+            'span_loss_a_dB':  fibers[a].get('span_loss_dB'),
+            'span_loss_b_dB':  fibers[b].get('span_loss_dB'),
             'avg_loss_a_dB_km': fibers[a].get('avg_loss_dB_per_km'),
             'avg_loss_b_dB_km': fibers[b].get('avg_loss_dB_per_km'),
             'avg_splice_a_dB': fibers[a].get('avg_splice_dB'),
             'avg_splice_b_dB': fibers[b].get('avg_splice_dB'),
             'max_splice_a_dB': fibers[a].get('max_splice_dB'),
             'max_splice_b_dB': fibers[b].get('max_splice_dB'),
+            'span_orl_a_dB':   fibers[a].get('span_orl_dB'),
+            'span_orl_b_dB':   fibers[b].get('span_orl_dB'),
         })
     pairs.sort(key=lambda x: x['max_diff_mdB'])
     return pairs
@@ -1210,21 +1283,14 @@ def _csv_rows_for_directions(directions):
         'Gap', 'Gap (s)',
         'Length Δ (m)',
     ]
-    # OTDR test parameters + results, per fiber (A then B for each metric).
+    # OTDR results panel — only the six left-column fields, per fiber.
     otdr_cols = [
-        'Wavelength A (nm)', 'Wavelength B (nm)',
-        'Pulse A (ns)',      'Pulse B (ns)',
-        'Resolution A (m)',  'Resolution B (m)',
-        'IOR A',             'IOR B',
-        'Backscatter A (dB)','Backscatter B (dB)',
-        'Splice Thr A (dB)', 'Splice Thr B (dB)',
-        'Refl Thr A (dB)',   'Refl Thr B (dB)',
-        'EOF Thr A (dB)',    'EOF Thr B (dB)',
-        'N Averages A',      'N Averages B',
-        'Span Loss A (dB)',  'Span Loss B (dB)',
-        'Avg Loss A (dB/km)','Avg Loss B (dB/km)',
-        'Avg Splice A (dB)', 'Avg Splice B (dB)',
-        'Max Splice A (dB)', 'Max Splice B (dB)',
+        'Span Length A (km)',  'Span Length B (km)',
+        'Span Loss A (dB)',    'Span Loss B (dB)',
+        'Avg Loss A (dB/km)',  'Avg Loss B (dB/km)',
+        'Avg Splice A (dB)',   'Avg Splice B (dB)',
+        'Max Splice A (dB)',   'Max Splice B (dB)',
+        'Span ORL A (dB)',     'Span ORL B (dB)',
     ]
     event_cols = []
     for i in range(1, max_events + 1):
@@ -1265,6 +1331,12 @@ def _csv_rows_for_directions(directions):
                     return ''
                 return round(v, nd) if nd is not None else v
 
+            # Convert span lengths to km for the Results panel display.
+            len_a_m = p.get('span_length_a_m')
+            len_b_m = p.get('span_length_b_m')
+            len_a_km = (len_a_m / 1000.0) if len_a_m else None
+            len_b_km = (len_b_m / 1000.0) if len_b_m else None
+
             row = [
                 d['label'],
                 p['fiber_a'], p['fiber_b'],
@@ -1276,20 +1348,13 @@ def _csv_rows_for_directions(directions):
                 (p.get('sn_b') or ''),
                 gap_str, gap_sec,
                 length_diff_val,
-                # OTDR test parameters / results
-                _r(p.get('wavelength_a_nm'), 1), _r(p.get('wavelength_b_nm'), 1),
-                _r(p.get('pulse_a_ns')),        _r(p.get('pulse_b_ns')),
-                _r(p.get('resolution_a_m'), 3), _r(p.get('resolution_b_m'), 3),
-                _r(p.get('ior_a'), 5),          _r(p.get('ior_b'), 5),
-                _r(p.get('backscatter_a_dB'), 1), _r(p.get('backscatter_b_dB'), 1),
-                _r(p.get('splice_thr_a_dB'), 3), _r(p.get('splice_thr_b_dB'), 3),
-                _r(p.get('refl_thr_a_dB'), 1),   _r(p.get('refl_thr_b_dB'), 1),
-                _r(p.get('eof_thr_a_dB'), 3),    _r(p.get('eof_thr_b_dB'), 3),
-                _r(p.get('n_avg_a')),            _r(p.get('n_avg_b')),
+                # OTDR Results panel (per fiber)
+                _r(len_a_km, 4),                 _r(len_b_km, 4),
                 _r(p.get('span_loss_a_dB'), 3),  _r(p.get('span_loss_b_dB'), 3),
                 _r(p.get('avg_loss_a_dB_km'), 4),_r(p.get('avg_loss_b_dB_km'), 4),
                 _r(p.get('avg_splice_a_dB'), 4), _r(p.get('avg_splice_b_dB'), 4),
                 _r(p.get('max_splice_a_dB'), 4), _r(p.get('max_splice_b_dB'), 4),
+                _r(p.get('span_orl_a_dB'), 2),   _r(p.get('span_orl_b_dB'), 2),
             ]
 
             per_event = p.get('per_event') or []
@@ -1315,19 +1380,30 @@ def _csv_rows_for_directions(directions):
     return header, rows
 
 
+def _excel_safe_sheet_name(name, used):
+    """Excel sheet names are capped at 31 chars and can't contain
+    [ ] : * ? / \\. Also need to be unique within the workbook."""
+    bad = set('[]:*?/\\')
+    cleaned = ''.join(c if c not in bad else '-' for c in name).strip()
+    cleaned = cleaned[:31] or 'Pairs'
+    base = cleaned
+    n = 2
+    while cleaned in used:
+        suffix = f' ({n})'
+        cleaned = base[:31 - len(suffix)] + suffix
+        n += 1
+    used.add(cleaned)
+    return cleaned
+
+
 def build_combined_xlsx(route_name, directions):
     """Build the same one-row-per-pair table as build_combined_csv but as
-    a real .xlsx workbook. Header row is bold and frozen; column widths
-    are roughly auto-sized so Excel/Numbers shows the data legibly."""
+    a real .xlsx workbook with **one sheet per direction**. Per-sheet
+    splitting keeps each direction under Excel's 1,048,576-row limit even
+    for 1000+ fiber routes."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill
     from openpyxl.utils import get_column_letter
-
-    header, rows = _csv_rows_for_directions(directions)
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Pairs"
 
     header_font = Font(bold=True, color='1F4E2C')
     header_fill = PatternFill(start_color='E8F5EC', end_color='E8F5EC',
@@ -1335,37 +1411,48 @@ def build_combined_xlsx(route_name, directions):
     center = Alignment(horizontal='center', vertical='center')
     left = Alignment(horizontal='left', vertical='center')
 
-    ws.append(header)
-    for cell in ws[1]:
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = center
-
-    for r in rows:
-        ws.append(r)
-
-    # Approximate column widths from observed content.
-    widths = [max(len(str(h)), 10) for h in header]
-    for r in rows:
-        for i, v in enumerate(r):
-            n = len(str(v)) if v != '' else 0
-            if n > widths[i]:
-                widths[i] = n
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = min(w + 2, 40)
-
-    # Left-align the text columns; everything else stays default-center for
-    # readability of numeric columns.
     text_cols = {
         'Direction', 'Filename A', 'Filename B',
         'Time A', 'Time B', 'Serial Number A', 'Serial Number B',
     }
-    for col_idx, name in enumerate(header, start=1):
-        if name in text_cols:
-            for row_idx in range(2, ws.max_row + 1):
-                ws.cell(row=row_idx, column=col_idx).alignment = left
 
-    ws.freeze_panes = 'A2'  # keep header visible while scrolling
+    wb = Workbook()
+    # Remove the default sheet — we'll add one per direction below.
+    wb.remove(wb.active)
+    used_names = set()
+
+    for d in directions:
+        header, rows = _csv_rows_for_directions([d])
+        sheet_name = _excel_safe_sheet_name(d['label'], used_names)
+        ws = wb.create_sheet(title=sheet_name)
+        ws.append(header)
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center
+        for r in rows:
+            ws.append(r)
+
+        # Approximate column widths from observed content (sampled).
+        widths = [max(len(str(h)), 10) for h in header]
+        sample = rows[: min(200, len(rows))]
+        for r in sample:
+            for i, v in enumerate(r):
+                n = len(str(v)) if v != '' else 0
+                if n > widths[i]:
+                    widths[i] = n
+        for i, w in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = min(w + 2, 40)
+
+        # Left-align text columns (only set on the first 5000 rows for
+        # speed on huge sheets; default alignment is fine elsewhere).
+        rows_to_style = min(ws.max_row, 5001)
+        for col_idx, name in enumerate(header, start=1):
+            if name in text_cols:
+                for row_idx in range(2, rows_to_style + 1):
+                    ws.cell(row=row_idx, column=col_idx).alignment = left
+
+        ws.freeze_panes = 'A2'
 
     out = io.BytesIO()
     wb.save(out)
