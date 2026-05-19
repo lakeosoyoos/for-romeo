@@ -1262,13 +1262,54 @@ def build_combined_csv(route_name, directions):
     return buf.getvalue().encode('utf-8-sig')  # BOM helps Excel detect UTF-8.
 
 
+# How many pairs to keep per ranking criterion in the exported workbook.
+# The union of the two top-N lists becomes the rows in the spreadsheet.
+TOP_PAIRS_PER_CRITERION = 300
+
+
+def _filter_top_pairs(pairs, n=TOP_PAIRS_PER_CRITERION):
+    """Return a list of (pair, in_top_max_diff, in_top_time_gap) tuples
+    covering the top-N by smallest Max Diff and the top-N by shortest Time
+    Gap, de-duplicated where a pair appears in both lists.
+
+    Order: max-diff top first (ascending), then time-gap top entries that
+    weren't already in the max-diff list."""
+    by_max = pairs[:n]  # compare_pairs returns pairs already sorted by max_diff
+    with_gap = [p for p in pairs if p.get('time_gap_sec') is not None]
+    by_gap = sorted(with_gap, key=lambda x: x['time_gap_sec'])[:n]
+
+    gap_keys = {(p['fiber_a'], p['fiber_b']) for p in by_gap}
+    seen = set()
+    out = []
+    for p in by_max:
+        key = (p['fiber_a'], p['fiber_b'])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((p, True, key in gap_keys))
+    for p in by_gap:
+        key = (p['fiber_a'], p['fiber_b'])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((p, False, True))
+    return out
+
+
 def _csv_rows_for_directions(directions):
     """Shared row builder used by both CSV and XLSX exports.
     Returns (header_columns, list_of_rows). Rows are plain Python values
     (numbers stay numeric where it makes sense for spreadsheet use)."""
+    # Pre-filter per direction: keep only the top N by Max Diff plus the
+    # top N by shortest Time Gap (union, de-duplicated). Output table size
+    # caps at ≤2N rows per direction.
+    filtered_per_direction = [
+        (d, _filter_top_pairs(d['pairs'])) for d in directions
+    ]
+
     max_events = 0
-    for d in directions:
-        for p in d['pairs']:
+    for _, filtered in filtered_per_direction:
+        for p, _, _ in filtered:
             n = len(p.get('per_event') or [])
             if n > max_events:
                 max_events = n
@@ -1278,6 +1319,7 @@ def _csv_rows_for_directions(directions):
         'Fiber A', 'Fiber B',
         'Filename A', 'Filename B',
         'Max Diff (mdB)',
+        'Top by Max Diff', 'Top by Time Gap',
         'Time A', 'Time B',
         'Serial Number A', 'Serial Number B',
         'Gap', 'Gap (s)',
@@ -1304,8 +1346,8 @@ def _csv_rows_for_directions(directions):
     header = base_cols + otdr_cols + event_cols + total_cols
 
     rows = []
-    for d in directions:
-        for p in d['pairs']:
+    for d, filtered in filtered_per_direction:
+        for p, in_top_max, in_top_gap in filtered:
             ts_a = p.get('timestamp_a')
             ts_b = p.get('timestamp_b')
             t_a = (datetime.fromtimestamp(ts_a).strftime('%Y-%m-%d %H:%M:%S')
@@ -1343,6 +1385,8 @@ def _csv_rows_for_directions(directions):
                 (p.get('filename_a') or ''),
                 (p.get('filename_b') or ''),
                 int(p['max_diff_mdB']),
+                'Y' if in_top_max else '',
+                'Y' if in_top_gap else '',
                 t_a, t_b,
                 (p.get('sn_a') or ''),
                 (p.get('sn_b') or ''),
