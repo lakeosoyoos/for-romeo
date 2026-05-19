@@ -58,6 +58,39 @@ st.caption(
     "pairs per ranking, multi-page tables with repeating headers."
 )
 
+# ----- sidebar settings -------------------------------------------------
+with st.sidebar:
+    st.header("Filter")
+    st.caption("Leave a field blank to include all pairs for that ranking.")
+    _limit_max_raw = st.text_input(
+        "Top pairs by Max Diff",
+        value="300",
+        help="Show the N pairs with the smallest Max Diff (mdB). "
+             "Blank or 0 = include all pairs.",
+    )
+    _limit_gap_raw = st.text_input(
+        "Top pairs by Time Gap",
+        value="300",
+        help="Show the N pairs with the shortest Time Gap. "
+             "Blank or 0 = include all pairs.",
+    )
+
+
+def _parse_limit(s):
+    """Empty / non-numeric / 0 / negative → None (no cap)."""
+    s = (s or '').strip()
+    if not s:
+        return None
+    try:
+        v = int(s)
+    except ValueError:
+        return None
+    return v if v > 0 else None
+
+
+LIMIT_MAX_DIFF = _parse_limit(_limit_max_raw)
+LIMIT_TIME_GAP = _parse_limit(_limit_gap_raw)
+
 # ----- upload -----------------------------------------------------------
 # Nonce is appended to the uploader's key so pressing "Clear" forces a fresh
 # widget, which drops the currently-uploaded files from Streamlit's state.
@@ -447,13 +480,19 @@ xlsx_input = [{
     'fiber_nums': d['fiber_nums'],
 } for d in directions]
 
-# Cache: rebuild only when the underlying direction set changes.
-xlsx_signature = repr([(d['label'], len(d['pairs']),
-                        d['pairs'][0]['max_diff_mdB'] if d['pairs'] else 0)
-                       for d in directions])
+# Cache: rebuild when the direction set OR the filter limits change.
+xlsx_signature = repr([
+    (d['label'], len(d['pairs']),
+     d['pairs'][0]['max_diff_mdB'] if d['pairs'] else 0)
+    for d in directions
+] + [LIMIT_MAX_DIFF, LIMIT_TIME_GAP])
 if st.session_state.get("xlsx_signature") != xlsx_signature:
     try:
-        st.session_state["xlsx_bytes"] = build_combined_xlsx(route_name, xlsx_input)
+        st.session_state["xlsx_bytes"] = build_combined_xlsx(
+            route_name, xlsx_input,
+            n_max_diff=LIMIT_MAX_DIFF,
+            n_time_gap=LIMIT_TIME_GAP,
+        )
         st.session_state["xlsx_signature"] = xlsx_signature
     except Exception as e:
         st.error(f"Excel export failed: {e}")

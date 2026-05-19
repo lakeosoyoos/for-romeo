@@ -1267,18 +1267,30 @@ def build_combined_csv(route_name, directions):
 TOP_PAIRS_PER_CRITERION = 300
 
 
-def _filter_top_pairs(pairs, n=TOP_PAIRS_PER_CRITERION):
+def _filter_top_pairs(pairs, n_max_diff=TOP_PAIRS_PER_CRITERION,
+                      n_time_gap=TOP_PAIRS_PER_CRITERION):
     """Return a list of (pair, in_top_max_diff, in_top_time_gap) tuples
     covering the top-N by smallest Max Diff and the top-N by shortest Time
     Gap, de-duplicated where a pair appears in both lists.
 
+    A limit of None or 0 means "no cap" for that criterion — every pair
+    becomes "in top" for that ranking. If both caps are unset, every pair
+    is emitted with both flags True (the spreadsheet shows all pairs).
+
     Order: max-diff top first (ascending), then time-gap top entries that
     weren't already in the max-diff list."""
-    by_max = pairs[:n]  # compare_pairs returns pairs already sorted by max_diff
+    unlimited_max = n_max_diff in (None, 0)
+    unlimited_gap = n_time_gap in (None, 0)
+
+    by_max = pairs if unlimited_max else pairs[:n_max_diff]
     with_gap = [p for p in pairs if p.get('time_gap_sec') is not None]
-    by_gap = sorted(with_gap, key=lambda x: x['time_gap_sec'])[:n]
+    if unlimited_gap:
+        by_gap = with_gap
+    else:
+        by_gap = sorted(with_gap, key=lambda x: x['time_gap_sec'])[:n_time_gap]
 
     gap_keys = {(p['fiber_a'], p['fiber_b']) for p in by_gap}
+    max_keys = {(p['fiber_a'], p['fiber_b']) for p in by_max}
     seen = set()
     out = []
     for p in by_max:
@@ -1292,19 +1304,23 @@ def _filter_top_pairs(pairs, n=TOP_PAIRS_PER_CRITERION):
         if key in seen:
             continue
         seen.add(key)
-        out.append((p, False, True))
+        out.append((p, key in max_keys, True))
     return out
 
 
-def _csv_rows_for_directions(directions):
+def _csv_rows_for_directions(directions, n_max_diff=TOP_PAIRS_PER_CRITERION,
+                              n_time_gap=TOP_PAIRS_PER_CRITERION):
     """Shared row builder used by both CSV and XLSX exports.
     Returns (header_columns, list_of_rows). Rows are plain Python values
-    (numbers stay numeric where it makes sense for spreadsheet use)."""
-    # Pre-filter per direction: keep only the top N by Max Diff plus the
-    # top N by shortest Time Gap (union, de-duplicated). Output table size
-    # caps at ≤2N rows per direction.
+    (numbers stay numeric where it makes sense for spreadsheet use).
+
+    `n_max_diff` / `n_time_gap`: per-criterion row caps. Pass None or 0 to
+    include all pairs for that criterion."""
     filtered_per_direction = [
-        (d, _filter_top_pairs(d['pairs'])) for d in directions
+        (d, _filter_top_pairs(d['pairs'],
+                              n_max_diff=n_max_diff,
+                              n_time_gap=n_time_gap))
+        for d in directions
     ]
 
     max_events = 0
@@ -1440,11 +1456,17 @@ def _excel_safe_sheet_name(name, used):
     return cleaned
 
 
-def build_combined_xlsx(route_name, directions):
+def build_combined_xlsx(route_name, directions,
+                        n_max_diff=TOP_PAIRS_PER_CRITERION,
+                        n_time_gap=TOP_PAIRS_PER_CRITERION):
     """Build the same one-row-per-pair table as build_combined_csv but as
     a real .xlsx workbook with **one sheet per direction**. Per-sheet
     splitting keeps each direction under Excel's 1,048,576-row limit even
-    for 1000+ fiber routes."""
+    for 1000+ fiber routes.
+
+    `n_max_diff` / `n_time_gap`: per-criterion row caps. Pass None or 0 for
+    "include every pair" on that criterion (the spreadsheet then shows all
+    pairs)."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill
     from openpyxl.utils import get_column_letter
@@ -1466,7 +1488,8 @@ def build_combined_xlsx(route_name, directions):
     used_names = set()
 
     for d in directions:
-        header, rows = _csv_rows_for_directions([d])
+        header, rows = _csv_rows_for_directions(
+            [d], n_max_diff=n_max_diff, n_time_gap=n_time_gap)
         sheet_name = _excel_safe_sheet_name(d['label'], used_names)
         ws = wb.create_sheet(title=sheet_name)
         ws.append(header)
