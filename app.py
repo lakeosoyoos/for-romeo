@@ -280,18 +280,47 @@ def parse_and_group(paths, on_progress=None):
                 key = (prefix, FALLBACK_SENTINEL, wl)
             raw_groups[key].append((fnum, rec, prefix))
 
+    def _share_common_base(prefixes, min_common=4, ratio=0.6):
+        """True if every prefix is mostly the same starting string, e.g.
+        {'MILTOP', 'MILTOPsh', 'MILTOPls'} → common 'MILTOP' which is
+        ≥4 chars and ≥60% of every prefix → variants of the same direction.
+        Compare to {'DNWRCH-A', 'RCHDNW-A'} where common prefix is empty →
+        genuinely different directions, split."""
+        if len(prefixes) <= 1:
+            return True
+        ps = sorted(prefixes)
+        common = ''
+        for i, c in enumerate(ps[0]):
+            if all(i < len(p) and p[i] == c for p in ps):
+                common += c
+            else:
+                break
+        if len(common) < min_common:
+            return False
+        if len(common) / min(len(p) for p in ps) < ratio:
+            return False
+        return True
+
     final = defaultdict(dict)
     for key, items in raw_groups.items():
         prefixes = {pre for _, _, pre in items}
-        # If there's only one filename prefix (or we already used the
-        # filename fallback) keep the bucket whole.
-        if len(prefixes) <= 1 or key[1] == FALLBACK_SENTINEL:
+        # Keep the bucket whole when:
+        #   • there's only one filename prefix, OR
+        #   • we already used the filename fallback (no firmware locations
+        #     to trust anyway), OR
+        #   • multiple prefixes all share a strong common base (e.g.
+        #     MILTOP / MILTOPsh / MILTOPls = same direction with different
+        #     shoot labels).
+        if (len(prefixes) <= 1
+                or key[1] == FALLBACK_SENTINEL
+                or _share_common_base(prefixes)):
             for fnum, rec, _ in items:
                 final[key][fnum] = rec
         else:
-            # Multiple distinct filename prefixes share the same firmware
-            # locations — split per prefix so overlapping fiber numbers
-            # don't overwrite each other.
+            # Different prefix roots share the same firmware locations
+            # (firmware quirk where direction isn't reflected in metadata) —
+            # split per prefix so overlapping fiber numbers don't overwrite
+            # each other.
             for fnum, rec, pre in items:
                 final[(key[0], key[1], key[2], pre)][fnum] = rec
     return final, skipped
